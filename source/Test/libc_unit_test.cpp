@@ -9,21 +9,21 @@
 #endif
 
 #if defined(__has_include)
-#if __has_include(<catch2/catch_all.hpp>)
+#if __has_include("catch2/catch_all.hpp")
 #define LIBC_UNIT_CATCH2_V3
-#include <catch2/catch_all.hpp>
-#elif __has_include(<catch2/catch.hpp>)
+#include "catch2/catch_all.hpp"
+#elif __has_include("catch2/catch.hpp")
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
-#elif __has_include(<catch.hpp>)
+#include "catch2/catch.hpp"
+#elif __has_include("catch.hpp")
 #define CATCH_CONFIG_MAIN
-#include <catch.hpp>
+#include "catch.hpp"
 #else
 #error "Catch2 headers were not found"
 #endif
 #else
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
+#include "catch2/catch.hpp"
 #endif
 
 /* Catch2 v2 uses __COUNTER__ in TEST_CASE and SECTION registrations. */

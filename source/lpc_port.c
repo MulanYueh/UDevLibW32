@@ -857,7 +857,13 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
     status = context->api.pfnNtCreatePort(&context->hLPCPortServerHandle, &objectAttributes,
                                           (ULONG)sizeof(uint32_t),
                                           (ULONG)LPC_PORT_NATIVE_MAX_MESSAGE_LENGTH, 0);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || !context->hLPCPortServerHandle) {
+        if (NT_SUCCESS(status)) {
+            status = STATUS_DATA_ERROR;
+        }
+        if (context->hLPCPortServerHandle && context->api.pfnNtClose) {
+            (void)context->api.pfnNtClose(context->hLPCPortServerHandle);
+        }
         context->api.pfnRtlFreeUnicodeString(&context->ustrLPCName);
         lpc_lock_destroy(&context->lockWord);
         lpc_lifetime_destroy(&context->lifetime);
@@ -921,7 +927,10 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     status = context->api.pfnNtCreateSection(&context->hSectionHandle,
                                              (ACCESS_MASK)(SECTION_MAP_READ | SECTION_MAP_WRITE), NULL,
                                              &sectionSize, PAGE_READWRITE, SEC_COMMIT, NULL);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || !context->hSectionHandle) {
+        if (NT_SUCCESS(status)) {
+            status = STATUS_DATA_ERROR;
+        }
         goto failure;
     }
 
@@ -941,7 +950,10 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     status = context->api.pfnNtConnectPort(&context->hLPCPortHandle, &context->ustrLPCName,
                                            &securityQos, &context->client_view, NULL,
                                            &maxMessageLength, &controlId, &controlIdLength);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || !context->hLPCPortHandle) {
+        if (NT_SUCCESS(status)) {
+            status = STATUS_DATA_ERROR;
+        }
         goto failure;
     }
     if (controlIdLength != (ULONG)sizeof(controlId) ||

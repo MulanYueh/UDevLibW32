@@ -870,7 +870,13 @@ NTSTATUS AlpcPort_ServerCreate(PALPC_PORT_SERVER_CONFIG config,
                               &securityQos);
     status = context->api.pfnNtAlpcCreatePort(&context->connectionPortHandle,
                                                &objectAttributes, &portAttributes);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || !context->connectionPortHandle) {
+        if (NT_SUCCESS(status)) {
+            status = STATUS_DATA_ERROR;
+        }
+        if (context->connectionPortHandle && context->api.pfnNtClose) {
+            (void)context->api.pfnNtClose(context->connectionPortHandle);
+        }
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->lockWord);
         alpc_lifetime_destroy(&context->lifetime);
@@ -1183,6 +1189,17 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             alpc_free(frame);
             alpc_lifetime_release(&context->lifetime);
             return status;
+        }
+        /* The native API may return a communication handle even when a test
+         * double or a future allocation path did not provide PortContext.
+         * Never dereference a missing record; close the endpoint and reject
+         * the connection instead of turning a malformed handshake into a
+         * kernel/user-mode crash. */
+        if (pending == (PALPC_PORT_SERVER_CLIENT)0) {
+            alpc_close_client_handle(context, clientPort, 1);
+            alpc_free(frame);
+            alpc_lifetime_release(&context->lifetime);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
         pending->portHandle = clientPort;
         pending->clientId = clientId;
@@ -1500,7 +1517,10 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
         &context->portHandle, &context->unicodeName, NULL, &portAttributes, 0,
         NULL, &connectionFrame->header, &bufferLength, NULL, NULL,
         timeoutArgument);
-    if (!NT_SUCCESS(status)) {
+    if (!NT_SUCCESS(status) || !context->portHandle) {
+        if (NT_SUCCESS(status)) {
+            status = STATUS_DATA_ERROR;
+        }
         if (context->portHandle && context->api.pfnNtClose) {
             if (context->api.pfnNtAlpcDisconnectPort) {
                 (void)context->api.pfnNtAlpcDisconnectPort(context->portHandle, 0);

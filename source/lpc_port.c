@@ -25,6 +25,14 @@
 #  undef LPC_PORT_DEFINED_ALLOCATOR_HAVE_WDK
 #endif
 
+/* Value-initialize aggregates in both languages without triggering C++
+ * -Wmissing-field-initializers while retaining C11 compatibility. */
+#if defined(__cplusplus)
+#  define LPC_PORT_ZERO_INIT {}
+#else
+#  define LPC_PORT_ZERO_INIT {0}
+#endif
+
 #if !LPC_PORT_HAS_PLATFORM_HEADERS && defined(_MSC_VER)
 #  include <intrin.h>
 #endif
@@ -471,7 +479,7 @@ static int lpc_port_message_valid(const PLPC_PORT_MESSAGE message, size_t buffer
  * request must not leave its caller blocked forever in NtRequestWaitReplyPort. */
 static int lpc_prepare_empty_reply(PLPC_HEADER header, size_t bufferSize)
 {
-    LPC_PORT_MESSAGE nativeHeader = {0};
+    LPC_PORT_MESSAGE nativeHeader = LPC_PORT_ZERO_INIT;
     PLPC_MESSAGE message = (PLPC_MESSAGE)0;
     size_t totalLength = LPC_HEADER_DATA_OFFSET + sizeof(ULONG);
     uint8_t useSharedMemory = 0;
@@ -519,7 +527,7 @@ static void lpc_clear_shared_memory(const PLPC_SERVER_CLIENT_INFO client)
 static NTSTATUS lpc_reject_connection(const LPC_SERVER_CONTEXT *context,
                                        PLPC_PORT_MESSAGE request)
 {
-    LPC_PORT_MESSAGE normalized = {0};
+    LPC_PORT_MESSAGE normalized = LPC_PORT_ZERO_INIT;
     HANDLE rejectedHandle = NULL;
     NTSTATUS status = STATUS_DATA_ERROR;
 
@@ -722,7 +730,7 @@ static NTSTATUS lpc_drop_client(PLPC_SERVER_CONTEXT context,
                                 uint8_t notify)
 {
     PLPC_SERVER_CLIENT_INFO client = NULL;
-    LPC_SERVER_EVT_CONTEXT events = {0};
+    LPC_SERVER_EVT_CONTEXT events = LPC_PORT_ZERO_INIT;
 
     if (!context || !clientHandle) {
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
@@ -800,9 +808,9 @@ static void lpc_reset_server_context(PLPC_SERVER_CONTEXT context) {
 }
 
 NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT context) {
-    ANSI_STRING ansiName = {0};
-    UNICODE_STRING unicodeName = {0};
-    OBJECT_ATTRIBUTES objectAttributes = {0};
+    ANSI_STRING ansiName = LPC_PORT_ZERO_INIT;
+    UNICODE_STRING unicodeName = LPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES objectAttributes = LPC_PORT_ZERO_INIT;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     if (!config || !context || !lpc_port_name_valid(&config->LpcName)) {
@@ -876,10 +884,10 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
 }
 
 NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context) {
-    ANSI_STRING ansiName = {0};
-    UNICODE_STRING unicodeName = {0};
-    LARGE_INTEGER sectionSize = {0};
-    SECURITY_QUALITY_OF_SERVICE securityQos = {0};
+    ANSI_STRING ansiName = LPC_PORT_ZERO_INIT;
+    UNICODE_STRING unicodeName = LPC_PORT_ZERO_INIT;
+    LARGE_INTEGER sectionSize = LPC_PORT_ZERO_INIT;
+    SECURITY_QUALITY_OF_SERVICE securityQos = LPC_PORT_ZERO_INIT;
     ULONG controlId = 0;
     ULONG controlIdLength = 0;
     ULONG maxMessageLength = 0;
@@ -1015,7 +1023,7 @@ void LpcPort_Disconnect(PLPC_CLIENT_CONTEXT context)
 
 void LpcPort_ServerClose(PLPC_SERVER_CONTEXT context) {
     PLPC_SERVER_CLIENT_INFO client = NULL;
-    LPC_SERVER_EVT_CONTEXT closeEvents = {0};
+    LPC_SERVER_EVT_CONTEXT closeEvents = LPC_PORT_ZERO_INIT;
 
     if (!context) {
         return;
@@ -1103,11 +1111,11 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
                                    ULONG messageLength, ULONG controlId, uint8_t useAsyncMode,
                                    uint8_t useSharedMemory,
                                    typedef_LpcSyncMsgReplyCallback replyCallback, void *callbackContext) {
-    LPC_MESSAGE_BUFFER requestStorage = {0};
-    LPC_MESSAGE_BUFFER replyStorage = {0};
+    LPC_MESSAGE_BUFFER requestStorage = LPC_PORT_ZERO_INIT;
+    LPC_MESSAGE_BUFFER replyStorage = LPC_PORT_ZERO_INIT;
     UCHAR *requestBuffer = NULL;
     UCHAR *replyBuffer = NULL;
-    LPC_HEADER sharedHeader = {0};
+    LPC_HEADER sharedHeader = LPC_PORT_ZERO_INIT;
     PLPC_HEADER request = NULL;
     PLPC_HEADER reply = NULL;
     PLPC_MESSAGE inlineMessage = NULL;
@@ -1188,8 +1196,12 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         if (messageLength) {
             libc_memcpy(inlineMessage->msg, message, messageLength);
         }
+        /* NtRequestPort assigns LPC_TYPE_DATAGRAM in the kernel.  Its
+         * user-mode input header must leave Type/ZeroInit clear; supplying
+         * the receive-side value is rejected by current Windows releases.
+         * NtRequestWaitReplyPort continues to use LPC_TYPE_REQUEST. */
         lpc_init_port_message(&request->header, totalLength,
-                              (USHORT)(actualAsync ? LPC_TYPE_DATAGRAM : LPC_TYPE_REQUEST));
+                              (USHORT)(actualAsync ? 0U : LPC_TYPE_REQUEST));
         if (actualAsync) {
             status = context->api.pfnNtRequestPort(context->hLPCPortHandle, &request->header);
             goto done;
@@ -1279,14 +1291,14 @@ uint8_t LpcPort_Register_ServerEvtCallback(PLPC_SERVER_CONTEXT context,
 
 NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
                                        const LARGE_INTEGER *timeout) {
-    LPC_MESSAGE_BUFFER receiveStorage = {0};
+    LPC_MESSAGE_BUFFER receiveStorage = LPC_PORT_ZERO_INIT;
     PLPC_HEADER received = NULL;
     PVOID portContext = NULL;
     HANDLE clientHandle = NULL;
     LPC_SERVER_CLIENT_INFO *clientInfo = NULL;
-    LPC_SERVER_EVT_CONTEXT events = {0};
+    LPC_SERVER_EVT_CONTEXT events = LPC_PORT_ZERO_INIT;
     USHORT messageType = 0;
-    LARGE_INTEGER timeoutValue = {0};
+    LARGE_INTEGER timeoutValue = LPC_PORT_ZERO_INIT;
     PLARGE_INTEGER timeoutArgument = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     NTSTATUS result = STATUS_UNSUCCESSFUL;
@@ -1362,10 +1374,17 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
         goto done;
     }
     messageType = received->header.u2.s2.Type;
+    /* NtRequestPort fills LPC_TYPE_DATAGRAM in the native receive header on
+     * Windows.  A lightweight transport double (and a few older LPC shims)
+     * can preserve the caller's zero Type instead; the SDK envelope's async
+     * bit still unambiguously identifies that message as a datagram. */
+    if (messageType == 0U && received->u1.s1.ulUseAsyncMethod) {
+        messageType = (USHORT)LPC_TYPE_DATAGRAM;
+    }
     if (messageType == LPC_TYPE_CONNECTION_REQUEST) {
         uint8_t deny = 1;
         uint32_t responseControlId = 0;
-        LPC_REMOTE_PORT_VIEW remoteView = {0};
+        LPC_REMOTE_PORT_VIEW remoteView = LPC_PORT_ZERO_INIT;
         PLPC_SERVER_CLIENT_INFO pending = NULL;
 
         /* The server receives only the caller's four-byte connection info. */

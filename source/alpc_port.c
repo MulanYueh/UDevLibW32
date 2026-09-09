@@ -23,6 +23,14 @@
 #  undef ALPC_PORT_DEFINED_ALLOCATOR_HAVE_WDK
 #endif
 
+/* Value-initialize aggregates in both languages without triggering C++
+ * -Wmissing-field-initializers while retaining C11 compatibility. */
+#if defined(__cplusplus)
+#  define ALPC_PORT_ZERO_INIT {}
+#else
+#  define ALPC_PORT_ZERO_INIT {0}
+#endif
+
 #if !ALPC_PORT_HAS_PLATFORM_HEADERS && defined(_MSC_VER)
 #  include <intrin.h>
 #endif
@@ -418,6 +426,28 @@ static PALPC_PORT_SERVER_CLIENT alpc_acquire_client(
     return current;
 }
 
+/* A native ALPC connection port is also the receive queue for messages from
+ * accepted clients.  A dispatcher that waits on that shared handle does not
+ * know the communication handle until it inspects the message, so provide a
+ * safe single-client fallback for that receive path.  Multi-client servers
+ * should use the ClientId in their dispatcher to select the record. */
+static PALPC_PORT_SERVER_CLIENT alpc_acquire_first_client(
+    PALPC_PORT_SERVER_CONTEXT context)
+{
+    PALPC_PORT_SERVER_CLIENT current = NULL;
+
+    if (!context || !context->lockWord.initialized) {
+        return NULL;
+    }
+    alpc_lock_acquire(&context->lockWord);
+    current = (PALPC_PORT_SERVER_CLIENT)List_Head(&context->clientList);
+    if (current && !alpc_lifetime_acquire(&current->lifetime)) {
+        current = NULL;
+    }
+    alpc_lock_release(&context->lockWord);
+    return current;
+}
+
 static void *alpc_alloc(SIZE_T size)
 {
     if (!size) {
@@ -455,7 +485,7 @@ static int alpc_server_api_valid(const ALPC_PORT_SERVER_APIS *api)
     return api && api->pfnRtlInitAnsiString &&
            api->pfnRtlAnsiStringToUnicodeString && api->pfnRtlFreeUnicodeString &&
            api->pfnNtClose && api->pfnNtAlpcCreatePort &&
-           api->pfnNtAlpcAcceptConnectPort && api->pfnNtAlpcCompleteConnectPort &&
+           api->pfnNtAlpcAcceptConnectPort &&
            api->pfnNtAlpcSendWaitReceivePort && api->pfnNtAlpcDisconnectPort;
 }
 
@@ -538,7 +568,7 @@ static NTSTATUS alpc_build_unicode_name(AlpcPort_RtlInitAnsiString initAnsiStrin
                                         const ALPC_PORT_NAME *name,
                                         PUNICODE_STRING unicodeName)
 {
-    ANSI_STRING ansiName = {0};
+    ANSI_STRING ansiName = ALPC_PORT_ZERO_INIT;
 
     if (!initAnsiString || !toUnicodeString || !alpc_name_valid(name) || !unicodeName) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
@@ -639,6 +669,9 @@ static NTSTATUS alpc_send_error_reply(const ALPC_PORT_SERVER_CONTEXT *context,
                                       NTSTATUS errorStatus)
 {
     NTSTATUS sendStatus = STATUS_DATA_ERROR;
+    ALPC_PORT_MESSAGE receiveHeader = ALPC_PORT_ZERO_INIT;
+    SIZE_T receiveLength = sizeof(receiveHeader);
+    LARGE_INTEGER noWait = ALPC_PORT_ZERO_INIT;
 
     if (!context || !context->api.pfnNtAlpcSendWaitReceivePort ||
         !alpc_prepare_error_reply(frame, context->maxMessageLength,
@@ -647,7 +680,10 @@ static NTSTATUS alpc_send_error_reply(const ALPC_PORT_SERVER_CONTEXT *context,
     }
     sendStatus = context->api.pfnNtAlpcSendWaitReceivePort(
         clientPort, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE, &frame->header, NULL,
-        NULL, NULL, NULL, NULL);
+        &receiveHeader, &receiveLength, NULL, &noWait);
+    if (sendStatus == STATUS_TIMEOUT) {
+        sendStatus = STATUS_SUCCESS;
+    }
     return NT_SUCCESS(sendStatus) ? errorStatus : sendStatus;
 }
 
@@ -657,7 +693,7 @@ static NTSTATUS alpc_send_error_reply(const ALPC_PORT_SERVER_CONTEXT *context,
 static NTSTATUS alpc_reject_connection(const ALPC_PORT_SERVER_CONTEXT *context,
                                        PALPC_PORT_FRAME frame)
 {
-    ALPC_PORT_MESSAGE normalized = {0};
+    ALPC_PORT_MESSAGE normalized = ALPC_PORT_ZERO_INIT;
     HANDLE rejectedPort = NULL;
     NTSTATUS status = STATUS_DATA_ERROR;
 
@@ -700,6 +736,23 @@ static int alpc_received_frame_valid(const PALPC_PORT_FRAME frame,
 static int alpc_message_type_is(USHORT actual, ULONG expected)
 {
     return actual == (USHORT)expected || actual == (USHORT)(expected & 0x0fffU);
+}
+
+/* Native ALPC control notifications are not SDK frames.  Depending on the
+ * Windows build, the Type field is reported either with the ALPC 0x2000
+ * namespace or as the low 12-bit LPC value.  Keep this test in one place so
+ * normal endpoint shutdown is never mistaken for corrupt application data. */
+static int alpc_native_control_type(USHORT actual)
+{
+    return alpc_message_type_is(actual, ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED) ||
+           actual == (USHORT)0x000BU || actual == (USHORT)0x000CU ||
+           actual == (USHORT)(ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST + 1U);
+}
+
+static int alpc_native_connection_complete_type(USHORT actual)
+{
+    return actual == (USHORT)0x000BU ||
+           actual == (USHORT)(ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST + 1U);
 }
 
 static void alpc_reset_client_context(PALPC_PORT_CLIENT_CONTEXT context)
@@ -826,9 +879,9 @@ static void alpc_release_client_info(PALPC_PORT_SERVER_CLIENT client)
 NTSTATUS AlpcPort_ServerCreate(PALPC_PORT_SERVER_CONFIG config,
                                PALPC_PORT_SERVER_CONTEXT context)
 {
-    ALPC_PORT_SDK_ATTRIBUTES portAttributes = {0};
-    OBJECT_ATTRIBUTES objectAttributes = {0};
-    SECURITY_QUALITY_OF_SERVICE securityQos = {0};
+    ALPC_PORT_SDK_ATTRIBUTES portAttributes = ALPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES objectAttributes = ALPC_PORT_ZERO_INIT;
+    SECURITY_QUALITY_OF_SERVICE securityQos = ALPC_PORT_ZERO_INIT;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     SIZE_T maxMessageLength = 0;
 
@@ -892,8 +945,8 @@ void AlpcPort_ServerClose(PALPC_PORT_SERVER_CONTEXT context)
 {
     PALPC_PORT_SERVER_CLIENT client = NULL;
     PALPC_PORT_SERVER_CLIENT orphanClients = NULL;
-    ALPC_PORT_SERVER_EVENTS closeEvents = {0};
-    LIST closingClients = {0};
+    ALPC_PORT_SERVER_EVENTS closeEvents = ALPC_PORT_ZERO_INIT;
+    LIST closingClients = ALPC_PORT_ZERO_INIT;
 
     if (!context || !alpc_state_claim_close(&context->initialized)) {
         return;
@@ -1054,11 +1107,11 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
                                          const LARGE_INTEGER *timeout)
 {
     PALPC_PORT_FRAME frame = NULL;
-    ALPC_PORT_SERVER_EVENTS events = {0};
+    ALPC_PORT_SERVER_EVENTS events = ALPC_PORT_ZERO_INIT;
     SIZE_T bufferLength = 0;
     uint32_t responseControlId = 0;
     uint8_t deny = 0;
-    LARGE_INTEGER timeoutValue = {0};
+    LARGE_INTEGER timeoutValue = ALPC_PORT_ZERO_INIT;
     PLARGE_INTEGER timeoutArgument = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
@@ -1130,7 +1183,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
     frame->ControlId = responseControlId;
     {
         HANDLE clientPort = NULL;
-        ALPC_PORT_CLIENT_ID clientId = {0};
+        ALPC_PORT_CLIENT_ID clientId = ALPC_PORT_ZERO_INIT;
         PALPC_PORT_SERVER_CLIENT pending = NULL;
 
         clientId = frame->header.ClientId;
@@ -1182,14 +1235,10 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             alpc_lifetime_release(&context->lifetime);
             return STATUS_DATA_ERROR;
         }
-        status = context->api.pfnNtAlpcCompleteConnectPort(clientPort);
-        if (!NT_SUCCESS(status)) {
-            alpc_close_client_handle(context, clientPort, 1);
-            alpc_release_client_info(pending);
-            alpc_free(frame);
-            alpc_lifetime_release(&context->lifetime);
-            return status;
-        }
+        /* Unlike legacy LPC, NtAlpcAcceptConnectPort completes an accepted
+         * ALPC connection itself.  Calling the legacy
+         * NtCompleteConnectPort syscall here injects an extra native control
+         * message and can corrupt the first application exchange. */
         /* The native API may return a communication handle even when a test
          * double or a future allocation path did not provide PortContext.
          * Never dereference a missing record; close the endpoint and reject
@@ -1234,7 +1283,7 @@ static NTSTATUS alpc_drop_client(PALPC_PORT_SERVER_CONTEXT context,
                                   uint8_t notify)
 {
     PALPC_PORT_SERVER_CLIENT client = NULL;
-    ALPC_PORT_SERVER_EVENTS events = {0};
+    ALPC_PORT_SERVER_EVENTS events = ALPC_PORT_ZERO_INIT;
 
     if (!context || alpc_state_load(&context->initialized) == 0 || !clientPort) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
@@ -1266,9 +1315,9 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
 {
     PALPC_PORT_FRAME frame = NULL;
     PALPC_PORT_SERVER_CLIENT client = NULL;
-    ALPC_PORT_SERVER_EVENTS events = {0};
+    ALPC_PORT_SERVER_EVENTS events = ALPC_PORT_ZERO_INIT;
     SIZE_T bufferLength = 0;
-    LARGE_INTEGER timeoutValue = {0};
+    LARGE_INTEGER timeoutValue = ALPC_PORT_ZERO_INIT;
     PLARGE_INTEGER timeoutArgument = NULL;
     ULONG messageType = 0;
     ULONG replyLength = 0;
@@ -1277,12 +1326,20 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
     NTSTATUS sendStatus = STATUS_UNSUCCESSFUL;
     NTSTATUS result = STATUS_UNSUCCESSFUL;
     uint8_t dropClient = 0;
+    HANDLE receivePort = clientPort;
+    HANDLE replyPort = clientPort;
+    ALPC_PORT_MESSAGE receiveHeader = ALPC_PORT_ZERO_INIT;
+    SIZE_T receiveLength = sizeof(receiveHeader);
+    LARGE_INTEGER noWait = ALPC_PORT_ZERO_INIT;
 
     if (!context || alpc_state_load(&context->initialized) == 0 || !clientPort ||
         !alpc_lifetime_acquire(&context->lifetime)) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
     }
     client = alpc_acquire_client(context, clientPort);
+    if (!client && clientPort == context->connectionPortHandle) {
+        client = alpc_acquire_first_client(context);
+    }
     if (!client) {
         alpc_lifetime_release(&context->lifetime);
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
@@ -1290,6 +1347,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
     /* One receive worker per communication port is required by ALPC.  The
      * lock also keeps a disconnect from closing the handle mid-call. */
     alpc_lock_acquire(&client->receiveLock);
+    replyPort = client->portHandle;
     frame = (PALPC_PORT_FRAME)alpc_alloc(context->maxMessageLength);
     if (!frame) {
         result = STATUS_INSUFFICIENT_RESOURCES;
@@ -1302,7 +1360,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         timeoutArgument = &timeoutValue;
     }
     status = context->api.pfnNtAlpcSendWaitReceivePort(
-        clientPort, 0, NULL, NULL, &frame->header, &bufferLength, NULL,
+        receivePort, 0, NULL, NULL, &frame->header, &bufferLength, NULL,
         timeoutArgument);
     if (status == STATUS_PORT_DISCONNECTED) {
         alpc_free(frame);
@@ -1317,6 +1375,19 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
     }
     if (!alpc_received_frame_valid(frame, bufferLength,
                                    context->maxMessageLength)) {
+        /* Native disconnect/control notifications carry only a PORT_MESSAGE
+         * header, not an SDK frame prefix.  Consume them before frame
+         * validation so a normal client shutdown is not reported as corrupt
+         * application data. */
+        if (alpc_native_control_type(frame->header.u2.s2.Type)) {
+            if (alpc_message_type_is(frame->header.u2.s2.Type,
+                                     ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED)) {
+                dropClient = 1;
+            }
+            alpc_free(frame);
+            result = STATUS_SUCCESS;
+            goto done;
+        }
         /* A native header is enough to preserve MessageId/ClientId for an
          * error reply even when the SDK frame prefix or payload is truncated.
          * Datagram traffic is intentionally fire-and-forget and is never
@@ -1327,7 +1398,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
                                  ALPC_PORT_MESSAGE_TYPE_REQUEST) &&
             !(bufferLength >= (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET &&
               (frame->Flags & ALPC_PORT_SEND_FLAG_ASYNC))) {
-            result = alpc_send_error_reply(context, clientPort, frame,
+            result = alpc_send_error_reply(context, replyPort, frame,
                                             STATUS_DATA_ERROR);
         } else {
             result = STATUS_DATA_ERROR;
@@ -1336,7 +1407,8 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         goto done;
     }
     messageType = frame->header.u2.s2.Type;
-    if (alpc_message_type_is((USHORT)messageType,
+    if (alpc_native_control_type((USHORT)messageType) &&
+        alpc_message_type_is((USHORT)messageType,
                              ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED)) {
         alpc_free(frame);
         dropClient = 1;
@@ -1361,11 +1433,22 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         callbackStatus = STATUS_SUCCESS;
         if (events.onAsyncRequest) {
             callbackStatus = events.onAsyncRequest(
-                clientPort, &frame->header.ClientId, frame->ControlId, frame->data,
+                replyPort, &frame->header.ClientId, frame->ControlId, frame->data,
                 frame->PayloadLength, events.callbackContext);
         }
         alpc_free(frame);
         result = callbackStatus;
+        goto done;
+    }
+    /* Windows emits a connection-complete notification (native type 11,
+     * LPC_CONNECTION_REPLY) on the accepted communication endpoint.  It is
+     * an internal handshake marker, not an application request; consuming it
+     * without replying prevents it from being mistaken for the first request
+     * made by the client. */
+    if (alpc_native_control_type((USHORT)messageType) &&
+        alpc_native_connection_complete_type((USHORT)messageType)) {
+        alpc_free(frame);
+        result = STATUS_SUCCESS;
         goto done;
     }
     if (!alpc_message_type_is((USHORT)messageType,
@@ -1373,7 +1456,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         /* A synchronous peer can otherwise wait forever on an unknown type.
          * ASYNC traffic has no reply channel and is intentionally dropped. */
         if ((frame->Flags & ALPC_PORT_SEND_FLAG_ASYNC) == 0) {
-            result = alpc_send_error_reply(context, clientPort, frame,
+            result = alpc_send_error_reply(context, replyPort, frame,
                                            STATUS_DATA_ERROR);
         } else {
             result = STATUS_DATA_ERROR;
@@ -1382,7 +1465,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         goto done;
     }
     if (frame->Flags != 0 || frame->Status != STATUS_SUCCESS) {
-        result = alpc_send_error_reply(context, clientPort, frame,
+        result = alpc_send_error_reply(context, replyPort, frame,
                                        STATUS_DATA_ERROR);
         alpc_free(frame);
         goto done;
@@ -1392,13 +1475,13 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
     callbackStatus = STATUS_SUCCESS;
     if (events.onSyncRequest) {
         callbackStatus = events.onSyncRequest(
-            clientPort, &frame->header.ClientId, frame->ControlId, frame->data,
+            replyPort, &frame->header.ClientId, frame->ControlId, frame->data,
             &replyLength,
             (ULONG)(context->maxMessageLength - (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET),
             events.callbackContext);
     }
     if (!alpc_set_frame_length(frame, context->maxMessageLength, replyLength)) {
-        result = alpc_send_error_reply(context, clientPort, frame,
+        result = alpc_send_error_reply(context, replyPort, frame,
                                        STATUS_INFO_LENGTH_MISMATCH);
         alpc_free(frame);
         goto done;
@@ -1407,8 +1490,12 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
     frame->Flags = 0;
     frame->Status = callbackStatus;
     sendStatus = context->api.pfnNtAlpcSendWaitReceivePort(
-        clientPort, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE, &frame->header, NULL,
-        NULL, NULL, NULL, NULL);
+        replyPort, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE,
+        &frame->header, NULL,
+        &receiveHeader, &receiveLength, NULL, &noWait);
+    if (sendStatus == STATUS_TIMEOUT) {
+        sendStatus = STATUS_SUCCESS;
+    }
     alpc_free(frame);
     if (!NT_SUCCESS(sendStatus)) {
         result = sendStatus;
@@ -1422,7 +1509,7 @@ done:
     if (dropClient) {
         /* The client pin is released before detach so this path cannot wait
          * on itself.  The server context pin is still held. */
-        (void)alpc_drop_client(context, clientPort, 0, 1);
+        (void)alpc_drop_client(context, replyPort, 0, 1);
     }
     alpc_lifetime_release(&context->lifetime);
     return result;
@@ -1451,12 +1538,12 @@ NTSTATUS AlpcPort_ServerDisconnectClient(PALPC_PORT_SERVER_CONTEXT context,
 NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
                           PALPC_PORT_CLIENT_CONTEXT context)
 {
-    ALPC_PORT_SDK_ATTRIBUTES portAttributes = {0};
-    SECURITY_QUALITY_OF_SERVICE securityQos = {0};
+    ALPC_PORT_SDK_ATTRIBUTES portAttributes = ALPC_PORT_ZERO_INIT;
+    SECURITY_QUALITY_OF_SERVICE securityQos = ALPC_PORT_ZERO_INIT;
     PALPC_PORT_FRAME connectionFrame = NULL;
     SIZE_T bufferLength = 0;
     SIZE_T maxMessageLength = 0;
-    LARGE_INTEGER timeoutValue = {0};
+    LARGE_INTEGER timeoutValue = ALPC_PORT_ZERO_INIT;
     PLARGE_INTEGER timeoutArgument = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
@@ -1555,6 +1642,33 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
     }
     context->maxMessageLength = maxMessageLength;
     context->negotiatedControlId = connectionFrame->ControlId;
+    /* Some Windows builds queue a native type-11 connection-complete marker
+     * on the client endpoint after NtAlpcConnectPort returns.  Poll it now,
+     * before the first application request; otherwise that marker can be
+     * returned as the apparent reply to that request. */
+    libc_memset(connectionFrame, 0, (size_t)maxMessageLength);
+    bufferLength = maxMessageLength;
+    timeoutValue.QuadPart = 0;
+    status = context->api.pfnNtAlpcSendWaitReceivePort(
+        context->portHandle, 0, NULL, NULL, &connectionFrame->header,
+        &bufferLength, NULL, &timeoutValue);
+    if (NT_SUCCESS(status) && connectionFrame->header.u2.s2.Type != 0U &&
+        !alpc_native_connection_complete_type(connectionFrame->header.u2.s2.Type)) {
+        /* Do not silently consume an application message returned during
+         * setup; reject the connection rather than desynchronizing it. */
+        if (context->api.pfnNtAlpcDisconnectPort) {
+            (void)context->api.pfnNtAlpcDisconnectPort(context->portHandle, 0);
+        }
+        if (context->api.pfnNtClose) {
+            (void)context->api.pfnNtClose(context->portHandle);
+        }
+        alpc_free(connectionFrame);
+        context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
+        alpc_lock_destroy(&context->sendLock);
+        alpc_lifetime_destroy(&context->lifetime);
+        alpc_reset_client_context(context);
+        return STATUS_DATA_ERROR;
+    }
     alpc_state_store(&context->initialized, 1);
     alpc_free(connectionFrame);
     return STATUS_SUCCESS;
@@ -1580,7 +1694,8 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
     ULONG replyCopyLength = 0;
     uint8_t asynchronous = 0;
     uint8_t haveReply = 0;
-    LARGE_INTEGER timeoutValue = {0};
+    uint32_t receiveAttempts = 0;
+    LARGE_INTEGER timeoutValue = ALPC_PORT_ZERO_INIT;
     PLARGE_INTEGER timeoutArgument = NULL;
 
     if (!context || alpc_state_load(&context->initialized) == 0 ||
@@ -1631,9 +1746,30 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
     }
     libc_memset(replyFrame, 0, (size_t)context->maxMessageLength);
     replyLength = context->maxMessageLength;
+    /* Keep a native synchronous request pending while the server handles it.
+     * Some builds return a local connection marker/request notification first;
+     * drain those notifications with receive-only calls without resending the
+     * application request. */
+    replyLength = context->maxMessageLength;
     status = context->api.pfnNtAlpcSendWaitReceivePort(
-        context->portHandle, 0, &requestFrame->header, NULL, &replyFrame->header,
+        context->portHandle, ALPC_PORT_NATIVE_FLAG_SYNC_REQUEST,
+        &requestFrame->header, NULL, &replyFrame->header,
         &replyLength, NULL, timeoutArgument);
+    if (NT_SUCCESS(status) &&
+        alpc_native_connection_complete_type(replyFrame->header.u2.s2.Type)) {
+        for (receiveAttempts = 0; receiveAttempts < 4U; ++receiveAttempts) {
+            libc_memset(replyFrame, 0, (size_t)context->maxMessageLength);
+            replyLength = context->maxMessageLength;
+            status = context->api.pfnNtAlpcSendWaitReceivePort(
+                context->portHandle, 0, NULL, NULL, &replyFrame->header,
+                &replyLength, NULL, timeoutArgument);
+            if (!NT_SUCCESS(status) ||
+                !alpc_native_connection_complete_type(
+                    replyFrame->header.u2.s2.Type)) {
+                break;
+            }
+        }
+    }
     alpc_free(requestFrame);
     if (!NT_SUCCESS(status)) {
         alpc_free(replyFrame);
@@ -1642,8 +1778,10 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
     }
     if (!alpc_received_frame_valid(replyFrame, replyLength,
                                    context->maxMessageLength) ||
-        !alpc_message_type_is(replyFrame->header.u2.s2.Type,
-                              ALPC_PORT_MESSAGE_TYPE_REPLY) ||
+        (!alpc_message_type_is(replyFrame->header.u2.s2.Type,
+                               ALPC_PORT_MESSAGE_TYPE_REPLY) &&
+         !alpc_message_type_is(replyFrame->header.u2.s2.Type,
+                               ALPC_PORT_MESSAGE_TYPE_REQUEST)) ||
         replyFrame->Flags != 0) {
         alpc_free(replyFrame);
         result = STATUS_DATA_ERROR;

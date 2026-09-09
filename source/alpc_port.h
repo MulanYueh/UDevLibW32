@@ -124,6 +124,45 @@ typedef LONG NTSTATUS;
 #  endif
 #endif
 
+/* These guarded values keep the API self-contained when a user-mode SDK does
+ * not include ntstatus.h.  WDK builds retain their native definitions. */
+#ifndef STATUS_SUCCESS
+#  define STATUS_SUCCESS ((NTSTATUS)(LONG)0x00000000UL)
+#endif
+#ifndef STATUS_UNSUCCESSFUL
+#  define STATUS_UNSUCCESSFUL ((NTSTATUS)(LONG)0xC0000001UL)
+#endif
+#ifndef STATUS_INVALID_PARAMETER
+#  define STATUS_INVALID_PARAMETER ((NTSTATUS)(LONG)0xC000000DUL)
+#endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#  define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)(LONG)0xC0000004UL)
+#endif
+#ifndef STATUS_DATA_ERROR
+#  define STATUS_DATA_ERROR ((NTSTATUS)(LONG)0xC000003EUL)
+#endif
+#ifndef STATUS_INSUFFICIENT_RESOURCES
+#  define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)(LONG)0xC000009AUL)
+#endif
+#ifndef STATUS_NOT_SUPPORTED
+#  define STATUS_NOT_SUPPORTED ((NTSTATUS)(LONG)0xC00000BBUL)
+#endif
+#ifndef STATUS_DEVICE_BUSY
+#  define STATUS_DEVICE_BUSY ((NTSTATUS)(LONG)0xC00000E8UL)
+#endif
+#ifndef STATUS_TIMEOUT
+#  define STATUS_TIMEOUT ((NTSTATUS)(LONG)0x00000102UL)
+#endif
+#ifndef STATUS_PORT_DISCONNECTED
+#  define STATUS_PORT_DISCONNECTED ((NTSTATUS)(LONG)0xC0000037UL)
+#endif
+#ifndef NT_SUCCESS
+#  define NT_SUCCESS(status) ((NTSTATUS)(status) >= 0)
+#endif
+#ifndef ANYSIZE_ARRAY
+#  define ANYSIZE_ARRAY 1
+#endif
+
 #include "list.h"
 
 /* ALPC serializes the endpoint state internally.  This lock protects only
@@ -197,6 +236,8 @@ typedef struct _ALPC_PORT_LIFETIME {
 #define ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST 0x200AU
 #define ALPC_PORT_SEND_FLAG_REPLY_MESSAGE         0x00000001UL
 #define ALPC_PORT_SEND_FLAG_ASYNC                 0x00000001UL
+/* Native NtAlpcSendWaitReceivePort flag: wait for the reply to this send. */
+#define ALPC_PORT_NATIVE_FLAG_SYNC_REQUEST        0x00020000UL
 
 /* Common values accepted in the portFlags fields.  Keep flags at zero unless
  * the deployment explicitly needs impersonation or duplicate-object support. */
@@ -369,6 +410,9 @@ typedef NTSTATUS (NTAPI *AlpcPort_NtAlpcAcceptConnectPort)(PHANDLE portHandle,
                                                             PALPC_PORT_MESSAGE connectionRequest,
                                                             PVOID connectionMessageAttributes,
                                                             BOOLEAN acceptConnection);
+/* ALPC uses the common LPC completion syscall exported as
+ * NtCompleteConnectPort (there is no NtAlpcCompleteConnectPort export in the
+ * supported user-mode ntdll).  The typedef name remains historical ABI. */
 typedef NTSTATUS (NTAPI *AlpcPort_NtAlpcCompleteConnectPort)(HANDLE portHandle);
 typedef NTSTATUS (NTAPI *AlpcPort_NtAlpcSendWaitReceivePort)(HANDLE portHandle,
                                                               ULONG flags,
@@ -391,7 +435,10 @@ typedef struct _ALPC_PORT_CLIENT_APIS {
     AlpcPort_NtAlpcDisconnectPort pfnNtAlpcDisconnectPort;
 } ALPC_PORT_CLIENT_APIS, *PALPC_PORT_CLIENT_APIS;
 
-/** Server-side resolver table.  Every field is mandatory. */
+/** Server-side resolver table.  The legacy completion slot is retained for
+ * source compatibility but is optional and never called by this ALPC SDK;
+ * Windows user mode exposes the LPC NtCompleteConnectPort name instead, and
+ * an accepted ALPC connection is already complete after NtAlpcAcceptConnectPort. */
 typedef struct _ALPC_PORT_SERVER_APIS {
     AlpcPort_RtlInitAnsiString pfnRtlInitAnsiString;
     AlpcPort_RtlAnsiStringToUnicodeString pfnRtlAnsiStringToUnicodeString;
@@ -399,6 +446,7 @@ typedef struct _ALPC_PORT_SERVER_APIS {
     AlpcPort_NtClose pfnNtClose;
     AlpcPort_NtAlpcCreatePort pfnNtAlpcCreatePort;
     AlpcPort_NtAlpcAcceptConnectPort pfnNtAlpcAcceptConnectPort;
+    /* Deprecated compatibility slot; leave NULL for new integrations. */
     AlpcPort_NtAlpcCompleteConnectPort pfnNtAlpcCompleteConnectPort;
     AlpcPort_NtAlpcSendWaitReceivePort pfnNtAlpcSendWaitReceivePort;
     AlpcPort_NtAlpcDisconnectPort pfnNtAlpcDisconnectPort;

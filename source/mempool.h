@@ -21,11 +21,10 @@
  * Destroy may overlap operations that have already entered the pool; it closes
  * admission and waits for those operations to leave.  Callers must stop
  * initiating work once teardown is requested and must not use the handle after
- * Destroy returns.  The kernel implementation uses a non-recursive push lock and
- * enters a critical region while holding it, so callers must also avoid
- * recursively entering the same pool operation.  All public functions are
- * annotated for APC_LEVEL or below because acquisition may wait and paged
- * pools may fault.
+ * Destroy returns.  The kernel implementation uses a non-recursive DPC spin
+ * lock for non-paged pools and retains PushLock for paged pools below DPC.
+ * Paged pools are rejected at DISPATCH_LEVEL; non-paged pools may be used
+ * there only with resident caller buffers.
  */
 
 #ifndef MEMPOOL_H
@@ -43,14 +42,13 @@ extern "C" {
 
 #ifdef _KERNEL_MODE
 /*
- * The pool may be either paged or non-paged, and its PushLock can wait.  A
- * single APC_LEVEL ceiling is therefore the safe contract for every public
- * operation.  Callers that need DISPATCH_LEVEL allocation must use a
- * dedicated non-blocking allocator instead of this pool.
+ * The pool may be either paged or non-paged.  Non-paged pools use a spin lock
+ * and are legal through DISPATCH_LEVEL.  A paged pool returns NULL/no-ops at
+ * DISPATCH_LEVEL instead of attempting a pageable allocation or dereference.
  */
-#define MEMPOOL_IRQL_MAX_APC _IRQL_requires_max_(APC_LEVEL)
+#define MEMPOOL_IRQL_MAX_DISPATCH _IRQL_requires_max_(DISPATCH_LEVEL)
 #else
-#define MEMPOOL_IRQL_MAX_APC
+#define MEMPOOL_IRQL_MAX_DISPATCH
 #endif
 
 typedef struct MEMPOOL MEMPOOL;
@@ -64,16 +62,17 @@ typedef enum MEMPOOL_TYPE {
 
 /*
  * Creates a paged or non-paged pool, depending on type.  Returns NULL when
- * the type is invalid or the first backing page cannot be allocated.
+ * the type is invalid, a paged pool is requested at DISPATCH_LEVEL, or the
+ * first backing page cannot be allocated.
  */
-MEMPOOL_IRQL_MAX_APC MEMPOOL *Mempool_CreatePool(MEMPOOL_TYPE type);
+MEMPOOL_IRQL_MAX_DISPATCH MEMPOOL *Mempool_CreatePool(MEMPOOL_TYPE type);
 
 /*
  * Destroys the pool and releases all pages and outstanding large chunks.
  * The return value is the number of backing pages released, including pages
  * occupied by large chunks.  All pointers from this pool become invalid.
  */
-MEMPOOL_IRQL_MAX_APC ULONG Mempool_DestroyPool(MEMPOOL *pool);
+MEMPOOL_IRQL_MAX_DISPATCH ULONG Mempool_DestroyPool(MEMPOOL *pool);
 
 /*
  * Allocates size bytes.  A zero-size request returns NULL.  The returned
@@ -81,14 +80,16 @@ MEMPOOL_IRQL_MAX_APC ULONG Mempool_DestroyPool(MEMPOOL *pool);
  * 16-byte on 64-bit builds.  It must be released with Mempool_Free rather
  * than a CRT or OS free routine.
  */
-MEMPOOL_IRQL_MAX_APC void *Mempool_Alloc(MEMPOOL *pool, ULONG size);
+MEMPOOL_IRQL_MAX_DISPATCH void *Mempool_Alloc(MEMPOOL *pool, ULONG size);
 
 /*
  * Releases a pointer returned by Mempool_Alloc; NULL is treated as misuse.
  * Like all allocators, this routine cannot make a pointer safe after its pool
  * has been destroyed; callers must finish/clear outstanding pointers first.
+ * A pointer belonging to a paged pool is not released at DISPATCH_LEVEL;
+ * defer that release to PASSIVE_LEVEL or APC_LEVEL.
  */
-MEMPOOL_IRQL_MAX_APC void Mempool_Free(void *ptr);
+MEMPOOL_IRQL_MAX_DISPATCH void Mempool_Free(void *ptr);
 
 /*
  * Security/performance policy (compile-time): the implementation leaves a
@@ -103,6 +104,6 @@ MEMPOOL_IRQL_MAX_APC void Mempool_Free(void *ptr);
 } /* extern "C" */
 #endif
 
-#undef MEMPOOL_IRQL_MAX_APC
+#undef MEMPOOL_IRQL_MAX_DISPATCH
 
 #endif /* MEMPOOL_H */

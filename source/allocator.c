@@ -28,7 +28,19 @@ extern void ExFreePoolWithTag(void *address, ULONG tag);
 void *
 Allocator_Malloc(BOOLEAN bUseNonPagedPool, size_t size, ULONG tag)
 {
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+#endif
+
     if (size == 0u || tag == 0u) {
+        return (void *)0;
+    }
+
+    /* PagedPool allocation is illegal at DPC.  Reject it before entering
+       either ExAllocatePool2 or the legacy ExAllocatePoolWithTag path. */
+    current_irql = KeGetCurrentIrql();
+    if (current_irql > DISPATCH_LEVEL ||
+        (current_irql == DISPATCH_LEVEL && !bUseNonPagedPool)) {
         return (void *)0;
     }
 

@@ -178,7 +178,9 @@ struct POOL {
     ULONG eyecatcher; /* Same tag as all pages owned by this pool. */
     ULONG pool_type;  /* MEMPOOL_PAGED or MEMPOOL_NONPAGED. */
 #ifdef _KERNEL_MODE
-    EX_PUSH_LOCK lock; /* Non-recursive; callers must not re-enter the pool. */
+    /* Non-paged pools use spin_lock; paged pools use PushLock below APC. */
+    KSPIN_LOCK spin_lock;
+    EX_PUSH_LOCK push_lock;
 #else
     CRITICAL_SECTION lock; /* Critical sections are recursive in user mode. */
 #endif
@@ -255,6 +257,31 @@ static void mempool_lifecycle_gate_exclusive_leave(void);
 static int mempool_operation_enter(POOL *pool);
 static void mempool_operation_leave(POOL *pool);
 static int mempool_begin_destroy(POOL *pool);
+
+/*
+ * Page metadata and payload are resident only for a non-paged pool.  At DPC
+ * level a paged pool must be rejected before any list/bitmap access because a
+ * page fault cannot be serviced there.  The registry/admission gate is
+ * acquired by the public callers before this helper dereferences pool.
+ */
+static int mempool_current_irql_allows_pool(POOL *pool)
+{
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+#endif
+
+    if (pool == (POOL *)0)
+        return 0;
+#ifdef _KERNEL_MODE
+    current_irql = KeGetCurrentIrql();
+    if (current_irql > DISPATCH_LEVEL)
+        return 0;
+    if (current_irql == DISPATCH_LEVEL &&
+        pool->pool_type == (ULONG)MEMPOOL_PAGED)
+        return 0;
+#endif
+    return 1;
+}
 
 static void mempool_zero(void *address, SIZE_T length)
 {
@@ -358,28 +385,46 @@ static void List_Remove(LIST *list, void *element)
 /* ------------------------------------------------------------------------- */
 
 /*
- * Only one exclusive lock is needed: it protects both page lists and the
- * bitmap state.  Large-chunk list updates use the same lock.  Destruction
- * closes admission and drains already-entered operations before it frees the
- * first page; it therefore never tries to acquire a lock from a freed pool.
- * EX_PUSH_LOCK is deliberately used without recursion in kernel mode.
+ * One exclusive lock protects both page lists and the bitmap state.  Large-
+ * chunk list updates use the same lock.  Non-paged pools use a DPC-safe spin
+ * lock; paged pools use PushLock below DPC so their pageable pages are never
+ * touched while IRQL is raised.  Destruction closes admission and drains
+ * already-entered operations before it frees the first page.
  */
 #ifdef _KERNEL_MODE
-#define MEMPOOL_LOCK_DECL
+typedef KIRQL MEMPOOL_LOCK_IRQL;
+typedef int MEMPOOL_LOCK_MODE;
+#define MEMPOOL_LOCK_DECL MEMPOOL_LOCK_IRQL lock_irql = (MEMPOOL_LOCK_IRQL)0;
+#define MEMPOOL_LOCK_MODE_DECL MEMPOOL_LOCK_MODE lock_mode = 0;
 #define MEMPOOL_LOCK(pool) \
     do { \
-        KeEnterCriticalRegion(); \
-        ExAcquirePushLockExclusive(&(pool)->lock); \
+        if ((pool)->pool_type == (ULONG)MEMPOOL_NONPAGED) { \
+            lock_mode = 1; \
+            KeAcquireSpinLock(&(pool)->spin_lock, &lock_irql); \
+        } else { \
+            lock_mode = 0; \
+            KeEnterCriticalRegion(); \
+            ExAcquirePushLockExclusive(&(pool)->push_lock); \
+        } \
     } while (0)
 #define MEMPOOL_UNLOCK(pool) \
     do { \
-        ExReleasePushLockExclusive(&(pool)->lock); \
-        KeLeaveCriticalRegion(); \
+        if (lock_mode != 0) \
+            KeReleaseSpinLock(&(pool)->spin_lock, lock_irql); \
+        else { \
+            ExReleasePushLockExclusive(&(pool)->push_lock); \
+            KeLeaveCriticalRegion(); \
+        } \
     } while (0)
 #else
-#define MEMPOOL_LOCK_DECL
-#define MEMPOOL_LOCK(pool) EnterCriticalSection(&(pool)->lock)
-#define MEMPOOL_UNLOCK(pool) LeaveCriticalSection(&(pool)->lock)
+typedef int MEMPOOL_LOCK_IRQL;
+typedef int MEMPOOL_LOCK_MODE;
+#define MEMPOOL_LOCK_DECL MEMPOOL_LOCK_IRQL lock_irql = (MEMPOOL_LOCK_IRQL)0;
+#define MEMPOOL_LOCK_MODE_DECL
+#define MEMPOOL_LOCK(pool) \
+    do { (void)lock_irql; EnterCriticalSection(&(pool)->lock); } while (0)
+#define MEMPOOL_UNLOCK(pool) \
+    do { (void)lock_irql; LeaveCriticalSection(&(pool)->lock); } while (0)
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -703,7 +748,8 @@ static POOL *mempool_create(ULONG pool_type, ULONG tag)
     pool->eyecatcher = tag;
     pool->pool_type = pool_type;
 #ifdef _KERNEL_MODE
-    ExInitializePushLock(&pool->lock);
+    KeInitializeSpinLock(&pool->spin_lock);
+    ExInitializePushLock(&pool->push_lock);
 #else
     if (!InitializeCriticalSectionAndSpinCount(&pool->lock, 1000UL)) {
         mempool_free_mem(page, tag);
@@ -744,6 +790,11 @@ MEMPOOL *Mempool_CreatePool(MEMPOOL_TYPE type)
        platform-specific allocation routine. */
     if (type != MEMPOOL_PAGED && type != MEMPOOL_NONPAGED)
         return (MEMPOOL *)0;
+#ifdef _KERNEL_MODE
+    /* Creating a paged backing pool at DPC would call a pageable allocator. */
+    if (KeGetCurrentIrql() >= DISPATCH_LEVEL && type == MEMPOOL_PAGED)
+        return (MEMPOOL *)0;
+#endif
     /* The registration outlives the pool object and lets later calls reject a
        stale opaque handle by address comparison without dereferencing it. */
     registration = (MEMPOOL_REGISTRATION *)mempool_registry_alloc();
@@ -777,7 +828,11 @@ ULONG Mempool_DestroyPool(MEMPOOL *pool)
     mempool_lifecycle_gate_exclusive_enter();
     registration = mempool_registry_find_locked(pool);
     if (registration == (MEMPOOL_REGISTRATION *)0 ||
-        !mempool_begin_destroy(pool)) {
+        !mempool_current_irql_allows_pool(pool)) {
+        mempool_lifecycle_gate_exclusive_leave();
+        return 0;
+    }
+    if (!mempool_begin_destroy(pool)) {
         mempool_lifecycle_gate_exclusive_leave();
         return 0;
     }
@@ -814,7 +869,7 @@ ULONG Mempool_DestroyPool(MEMPOOL *pool)
     }
 
 #ifdef _KERNEL_MODE
-    /* EX_PUSH_LOCK is embedded in the pool and needs no separate cleanup. */
+    /* KSPIN_LOCK is embedded in the pool and needs no separate cleanup. */
 #else
     DeleteCriticalSection(&pool->lock);
 #endif
@@ -854,6 +909,10 @@ void *Mempool_Alloc(MEMPOOL *pool, ULONG size)
         return (void *)0;
     }
     operation_entered = 1;
+    if (!mempool_current_irql_allows_pool(pool)) {
+        mempool_operation_leave(pool);
+        return (void *)0;
+    }
     total_size = size + (ULONG)MEMPOOL_ALLOCATION_HEADER_SIZE;
     /* A large request bypasses the bitmap and receives page-granular memory. */
     if (total_size > MEMPOOL_LARGE_CHUNK_MINIMUM) {
@@ -929,6 +988,11 @@ void Mempool_Free(void *address)
         return;
     }
     operation_entered = 1;
+    if (!mempool_current_irql_allows_pool(pool)) {
+        mempool_lifecycle_gate_shared_leave();
+        mempool_operation_leave(pool);
+        return;
+    }
     total_size = *(ULONG *)base_address;
     if (total_size < (ULONG)MEMPOOL_ALLOCATION_HEADER_SIZE) {
         mempool_lifecycle_gate_shared_leave();
@@ -1055,6 +1119,7 @@ static void *mempool_get_cells(POOL *pool, ULONG cell_count)
     ULONG remaining = 0;
     UCHAR *address = (UCHAR *)0;
     MEMPOOL_LOCK_DECL
+    MEMPOOL_LOCK_MODE_DECL
 
     /* num_free is an exact count; max_free_run is an exact cached filter after
        a failed scan, and zero means the bitmap must be scanned. */
@@ -1144,6 +1209,7 @@ static void mempool_free_cells(void *address, ULONG cell_count)
     MEMPOOL_PAGE *release_page = (MEMPOOL_PAGE *)0;
     ULONG release_tag = 0;
     MEMPOOL_LOCK_DECL
+    MEMPOOL_LOCK_MODE_DECL
 
     /* cell_count comes from the hidden size word read by Mempool_Free. */
     if (address == (void *)0 || cell_count == 0)
@@ -1255,6 +1321,7 @@ static void *mempool_get_large_chunk(POOL *pool, ULONG size)
     void *address = (void *)0;
     MEMPOOL_LARGE_CHUNK *chunk = (MEMPOOL_LARGE_CHUNK *)0;
     MEMPOOL_LOCK_DECL
+    MEMPOOL_LOCK_MODE_DECL
 
     /* Layout of a large allocation:
        [size word + caller bytes ........ padding][LARGE_CHUNK descriptor] */
@@ -1286,6 +1353,7 @@ static void mempool_free_large_chunk(void *address, ULONG size)
     MEMPOOL_LARGE_CHUNK *chunk = (MEMPOOL_LARGE_CHUNK *)0;
     POOL *pool = (POOL *)0;
     MEMPOOL_LOCK_DECL
+    MEMPOOL_LOCK_MODE_DECL
 
     /* Recompute the same rounded size used by GetLargeChunk to locate the
        descriptor at the end of the allocation. */

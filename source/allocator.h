@@ -34,8 +34,9 @@ extern "C" {
  * In kernel mode bUseNonPagedPool must be nonzero for resident memory and
  * zero for paged memory.  The implementation selects ExAllocatePool2 when
  * the target WDK is Windows 10 2004 or newer; otherwise it uses
- * ExAllocatePoolWithTag.  The caller must free the result with Allocator_Free
- * and must use the same tag supplied to Allocator_Malloc.
+ * ExAllocatePoolWithTag.  At DISPATCH_LEVEL a paged request is rejected
+ * before the system allocator is called.  The caller must free the result
+ * with Allocator_Free and must use the same tag supplied to Allocator_Malloc.
  */
 #ifdef _KERNEL_MODE
 void *Allocator_Malloc(BOOLEAN bUseNonPagedPool, size_t size, ULONG tag);

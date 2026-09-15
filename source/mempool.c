@@ -14,13 +14,12 @@
 #include "def.h"
 #include "allocator.h"
 
-#ifndef _KERNEL_MODE
 /*
  * The project CRT is freestanding and is also available to user-mode
- * callers.  Keep this source's dependency narrow instead of including the
- * full libc.h: that public header also declares optional C99-era utilities
- * which old C compilers do not need to parse.  These declarations mirror the
- * raw-memory ABI in libc.h; link libc.c when building the user-mode allocator.
+ * and kernel-mode callers.  Keep this source's dependency narrow instead of
+ * including the full libc.h: these declarations mirror the raw-memory ABI in
+ * libc.h and avoid pulling optional declarations into old MSVC builds.  The
+ * kernel image must link the resident libc_memset/libc_memcpy objects.
  */
 #include <stddef.h>
 #if defined(_MSC_VER)
@@ -36,7 +35,6 @@ extern void *MEMPOOL_LIBC_CALL libc_memset(void *dst, int value,
 extern void *MEMPOOL_LIBC_CALL libc_memcpy(void *dst, const void *src,
                                            size_t count);
 #undef MEMPOOL_LIBC_CALL
-#endif
 
 /*
  * Design overview
@@ -71,6 +69,10 @@ extern void *MEMPOOL_LIBC_CALL libc_memcpy(void *dst, const void *src,
  * pointer in the second pointer-sized slot.  Mempool_Free uses that owner slot
  * to enter the pool's lifetime gate before touching page metadata; this closes
  * the otherwise racy window between a concurrent Free and page destruction.
+ * Since the public Free API receives no pool handle, a caller must not pass a
+ * paged allocation to it at DPC: reading this hidden owner slot can itself
+ * fault when the page is not resident, and no portable check can prove the
+ * entire opaque range is resident at that IRQL.
  *
  * Page ownership is represented by two intrusive lists:
  *
@@ -178,9 +180,8 @@ struct POOL {
     ULONG eyecatcher; /* Same tag as all pages owned by this pool. */
     ULONG pool_type;  /* MEMPOOL_PAGED or MEMPOOL_NONPAGED. */
 #ifdef _KERNEL_MODE
-    /* Non-paged pools use spin_lock; paged pools use PushLock below APC. */
+    /* One DPC-safe spin lock protects every kernel pool instance. */
     KSPIN_LOCK spin_lock;
-    EX_PUSH_LOCK push_lock;
 #else
     CRITICAL_SECTION lock; /* Critical sections are recursive in user mode. */
 #endif
@@ -232,6 +233,7 @@ static volatile LONG mempool_lifecycle_gate = 0;
 typedef struct MEMPOOL_REGISTRATION MEMPOOL_REGISTRATION;
 struct MEMPOOL_REGISTRATION {
     POOL *pool;
+    ULONG pool_type;
     MEMPOOL_REGISTRATION *next;
 };
 static MEMPOOL_REGISTRATION *mempool_registry =
@@ -250,7 +252,7 @@ static void *mempool_get_large_chunk(POOL *pool, ULONG size);
 static void mempool_free_large_chunk(void *address, ULONG size);
 static POOL *mempool_create(ULONG pool_type, ULONG tag);
 static void mempool_abend(ULONG reason);
-static void mempool_lifecycle_gate_shared_enter(void);
+static int mempool_lifecycle_gate_shared_enter(void);
 static void mempool_lifecycle_gate_shared_leave(void);
 static void mempool_lifecycle_gate_exclusive_enter(void);
 static void mempool_lifecycle_gate_exclusive_leave(void);
@@ -259,10 +261,11 @@ static void mempool_operation_leave(POOL *pool);
 static int mempool_begin_destroy(POOL *pool);
 
 /*
- * Page metadata and payload are resident only for a non-paged pool.  At DPC
- * level a paged pool must be rejected before any list/bitmap access because a
- * page fault cannot be serviced there.  The registry/admission gate is
- * acquired by the public callers before this helper dereferences pool.
+ * Kernel backing pages (including the logical paged-pool variant) are resident
+ * because the pool lock may raise IRQL while metadata is inspected.  A
+ * logical paged pool is still rejected at DPC before any list/bitmap access;
+ * its public contract remains PASSIVE/APC-only.  The registry/admission gate
+ * is acquired by public callers before this helper dereferences the pool.
  */
 static int mempool_current_irql_allows_pool(POOL *pool)
 {
@@ -285,26 +288,17 @@ static int mempool_current_irql_allows_pool(POOL *pool)
 
 static void mempool_zero(void *address, SIZE_T length)
 {
-#ifdef _KERNEL_MODE
-    RtlZeroMemory(address, length);
-#else
     /* libc_memset is the project's CRT-independent implementation; callers
        pass storage owned by the pool and a length checked by the layout. */
-    libc_memset(address, 0, (size_t)length);
-#endif
+    (void)libc_memset(address, 0, (size_t)length);
 }
 
 static void mempool_copy(void *destination, const void *source, SIZE_T length)
 {
-    /* Keep platform memory primitives in the kernel build. */
-#ifdef _KERNEL_MODE
-    RtlCopyMemory(destination, source, length);
-#else
     /* The source and destination are non-overlapping bitmap regions.  Keep
        this primitive separate from the checked Move path, which uses memmove
        when caller ranges may overlap. */
-    libc_memcpy(destination, source, (size_t)length);
-#endif
+    (void)libc_memcpy(destination, source, (size_t)length);
 }
 
 static void mempool_abend(ULONG reason)
@@ -387,9 +381,11 @@ static void List_Remove(LIST *list, void *element)
 /*
  * One exclusive lock protects both page lists and the bitmap state.  Large-
  * chunk list updates use the same lock.  Non-paged pools use a DPC-safe spin
- * lock; paged pools use PushLock below DPC so their pageable pages are never
- * touched while IRQL is raised.  Destruction closes admission and drains
- * already-entered operations before it frees the first page.
+ * lock.  Kernel backing pages are resident so page metadata and bitmap bytes
+ * are safe to inspect while KeAcquireSpinLock has raised IRQL.  A logical
+ * MEMPOOL_PAGED still remains unavailable to callers at DISPATCH_LEVEL; this
+ * preserves the existing pool-type contract while keeping synchronization
+ * uniform and DPC-safe.
  */
 #ifdef _KERNEL_MODE
 typedef KIRQL MEMPOOL_LOCK_IRQL;
@@ -398,23 +394,19 @@ typedef int MEMPOOL_LOCK_MODE;
 #define MEMPOOL_LOCK_MODE_DECL MEMPOOL_LOCK_MODE lock_mode = 0;
 #define MEMPOOL_LOCK(pool) \
     do { \
-        if ((pool)->pool_type == (ULONG)MEMPOOL_NONPAGED) { \
-            lock_mode = 1; \
+        /* Use the non-raising DPC form when already at DISPATCH_LEVEL. */ \
+        lock_mode = KeGetCurrentIrql() == DISPATCH_LEVEL ? 2 : 1; \
+        if (lock_mode == 2) \
+            KeAcquireSpinLockAtDpcLevel(&(pool)->spin_lock); \
+        else \
             KeAcquireSpinLock(&(pool)->spin_lock, &lock_irql); \
-        } else { \
-            lock_mode = 0; \
-            KeEnterCriticalRegion(); \
-            ExAcquirePushLockExclusive(&(pool)->push_lock); \
-        } \
     } while (0)
 #define MEMPOOL_UNLOCK(pool) \
     do { \
-        if (lock_mode != 0) \
+        if (lock_mode == 2) \
+            KeReleaseSpinLockFromDpcLevel(&(pool)->spin_lock); \
+        else \
             KeReleaseSpinLock(&(pool)->spin_lock, lock_irql); \
-        else { \
-            ExReleasePushLockExclusive(&(pool)->push_lock); \
-            KeLeaveCriticalRegion(); \
-        } \
     } while (0)
 #else
 typedef int MEMPOOL_LOCK_IRQL;
@@ -451,19 +443,28 @@ typedef int MEMPOOL_LOCK_MODE;
 #define MEMPOOL_LIFECYCLE_YIELD() Sleep(0)
 #endif
 
-static void mempool_lifecycle_gate_shared_enter(void)
+static int mempool_lifecycle_gate_shared_enter(void)
 {
     LONG state = 0;
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+    current_irql = KeGetCurrentIrql();
+#endif
 
     for (;;) {
         state = InterlockedCompareExchange(&mempool_lifecycle_gate, 0, 0);
         if ((state & MEMPOOL_LIFECYCLE_CLOSING) != 0 ||
             (state & MEMPOOL_LIFECYCLE_COUNT_MASK) ==
                 MEMPOOL_LIFECYCLE_COUNT_MASK) {
+#ifdef _KERNEL_MODE
+            /* APC/DPC cannot wait for a lower-IRQL destroyer on this CPU. */
+            if (current_irql >= APC_LEVEL)
+                return 0;
+#endif
             MEMPOOL_LIFECYCLE_YIELD();
         } else if (InterlockedCompareExchange(
                        &mempool_lifecycle_gate, state + 1, state) == state) {
-            return;
+            return 1;
         }
     }
 }
@@ -592,13 +593,33 @@ static int mempool_operation_admit(POOL *pool)
 {
     MEMPOOL_REGISTRATION *registration = (MEMPOOL_REGISTRATION *)0;
     int accepted = 0;
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+#endif
 
     if (pool == (POOL *)0)
         return 0;
-    mempool_lifecycle_gate_shared_enter();
+#ifdef _KERNEL_MODE
+    current_irql = KeGetCurrentIrql();
+    if (current_irql > DISPATCH_LEVEL)
+        return 0;
+#endif
+    if (mempool_lifecycle_gate_shared_enter() == 0)
+        return 0;
     registration = mempool_registry_find_locked(pool);
     if (registration != (MEMPOOL_REGISTRATION *)0)
+    {
+#ifdef _KERNEL_MODE
+        /* Never dereference a pageable POOL object at DPC. */
+        if (current_irql == DISPATCH_LEVEL &&
+            registration->pool_type == (ULONG)MEMPOOL_PAGED)
+        {
+            mempool_lifecycle_gate_shared_leave();
+            return 0;
+        }
+#endif
         accepted = mempool_operation_enter(pool);
+    }
     mempool_lifecycle_gate_shared_leave();
     return accepted;
 }
@@ -647,10 +668,11 @@ static void *mempool_alloc_mem(ULONG pool_type, ULONG size, ULONG tag)
     DWORD protection = 0;
 #endif
 #ifdef _KERNEL_MODE
-    /* PagedPool and NonPagedPool are selected once when the pool is created. */
-    address = Allocator_Malloc(
-        (BOOLEAN)(pool_type == (ULONG)MEMPOOL_NONPAGED),
-        (size_t)size, tag);
+    /* A KSPIN_LOCK protects page metadata at raised IRQL, so all kernel
+       backing pages must be resident even when the logical pool type is
+       MEMPOOL_PAGED.  Mempool_Alloc still rejects that logical type at DPC. */
+    UNREFERENCED_PARAMETER(pool_type);
+    address = Allocator_Malloc(TRUE, (size_t)size, tag);
 #else
     /* VirtualAlloc supplies the 64 KiB alignment required by user mode. */
     UNREFERENCED_PARAMETER(pool_type);
@@ -749,7 +771,6 @@ static POOL *mempool_create(ULONG pool_type, ULONG tag)
     pool->pool_type = pool_type;
 #ifdef _KERNEL_MODE
     KeInitializeSpinLock(&pool->spin_lock);
-    ExInitializePushLock(&pool->push_lock);
 #else
     if (!InitializeCriticalSectionAndSpinCount(&pool->lock, 1000UL)) {
         mempool_free_mem(page, tag);
@@ -791,8 +812,9 @@ MEMPOOL *Mempool_CreatePool(MEMPOOL_TYPE type)
     if (type != MEMPOOL_PAGED && type != MEMPOOL_NONPAGED)
         return (MEMPOOL *)0;
 #ifdef _KERNEL_MODE
-    /* Creating a paged backing pool at DPC would call a pageable allocator. */
-    if (KeGetCurrentIrql() >= DISPATCH_LEVEL && type == MEMPOOL_PAGED)
+    /* Creation takes the process-wide writer gate and may allocate metadata;
+       keep it at PASSIVE_LEVEL so an APC/DPC cannot wait behind teardown. */
+    if (KeGetCurrentIrql() >= APC_LEVEL)
         return (MEMPOOL *)0;
 #endif
     /* The registration outlives the pool object and lets later calls reject a
@@ -806,6 +828,7 @@ MEMPOOL *Mempool_CreatePool(MEMPOOL_TYPE type)
         return (MEMPOOL *)0;
     }
     registration->pool = pool;
+    registration->pool_type = (ULONG)type;
     registration->next = (MEMPOOL_REGISTRATION *)0;
     mempool_registry_add(registration);
     return pool;
@@ -820,11 +843,21 @@ ULONG Mempool_DestroyPool(MEMPOOL *pool)
     MEMPOOL_PAGE *pool_page = (MEMPOOL_PAGE *)0;
     ULONG page_count = 0;
     MEMPOOL_REGISTRATION *registration = (MEMPOOL_REGISTRATION *)0;
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+#endif
 
     /* The writer gate removes the registration before the first page (which
        contains this lock and lifecycle state) can be released. */
     if (pool == (POOL *)0)
         return 0;
+#ifdef _KERNEL_MODE
+    /* Destruction waits for admitted operations; an APC/DPC must not wait for
+       a lower-IRQL owner on the same CPU, even for a non-paged pool. */
+    current_irql = KeGetCurrentIrql();
+    if (current_irql >= APC_LEVEL)
+        return 0;
+#endif
     mempool_lifecycle_gate_exclusive_enter();
     registration = mempool_registry_find_locked(pool);
     if (registration == (MEMPOOL_REGISTRATION *)0 ||
@@ -964,11 +997,20 @@ void Mempool_Free(void *address)
     MEMPOOL_LARGE_CHUNK *chunk = (MEMPOOL_LARGE_CHUNK *)0;
     int metadata_valid = 0;
     int operation_entered = 0;
+#ifdef _KERNEL_MODE
+    KIRQL current_irql = PASSIVE_LEVEL;
+#endif
 
     if (address == (void *)0) {
         mempool_abend(MEMPOOL_ABEND_FREE_NULL);
         return;
     }
+#ifdef _KERNEL_MODE
+    /* Do not even inspect the hidden owner word above DISPATCH_LEVEL. */
+    current_irql = KeGetCurrentIrql();
+    if (current_irql > DISPATCH_LEVEL)
+        return;
+#endif
     if ((ULONG_PTR)address < (ULONG_PTR)MEMPOOL_ALLOCATION_HEADER_SIZE) {
         mempool_abend(MEMPOOL_ABEND_FREE_CELLS_RANGE);
         return;
@@ -979,7 +1021,8 @@ void Mempool_Free(void *address)
     /* Keep the shared admission gate while reading both the owner slot and
        the page/chunk owner.  This prevents DestroyPool from freeing the
        backing page between those reads and operation admission. */
-    mempool_lifecycle_gate_shared_enter();
+    if (mempool_lifecycle_gate_shared_enter() == 0)
+        return;
     pool = *((POOL **)((UCHAR *)base_address + sizeof(ULONG_PTR)));
     if (pool == (POOL *)0 || mempool_registry_find_locked(pool) ==
             (MEMPOOL_REGISTRATION *)0 || !mempool_operation_enter(pool)) {

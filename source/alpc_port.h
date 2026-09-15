@@ -156,6 +156,9 @@ typedef LONG NTSTATUS;
 #ifndef STATUS_PORT_DISCONNECTED
 #  define STATUS_PORT_DISCONNECTED ((NTSTATUS)(LONG)0xC0000037UL)
 #endif
+#ifndef STATUS_PENDING
+#  define STATUS_PENDING ((NTSTATUS)(LONG)0x00000103UL)
+#endif
 #ifndef NT_SUCCESS
 #  define NT_SUCCESS(status) ((NTSTATUS)(status) >= 0)
 #endif
@@ -320,6 +323,14 @@ typedef NTSTATUS (NTAPI *AlpcPort_SyncReplyCallback)(const uint8_t *buffer,
                                                       ULONG length,
                                                       PVOID callbackContext);
 
+/* Handles an unsolicited request or datagram observed while a client is
+ * waiting for its own reply.  For a request, the callback may edit frame->data
+ * and frame->PayloadLength; the transport sends the resulting frame as a
+ * reply.  It must not call AlpcPort_SendMessage recursively on the same
+ * context. */
+typedef NTSTATUS (NTAPI *AlpcPort_IncomingRequestCallback)(
+    PALPC_PORT_FRAME frame, SIZE_T capacity, PVOID callbackContext);
+
 /** Runs before the server accepts a connection; deny is initialized to one. */
 typedef void (*AlpcPort_PreConnectCallback)(uint32_t *responseControlId,
                                              uint8_t *deny,
@@ -461,6 +472,9 @@ typedef struct _ALPC_PORT_CLIENT_CONFIG {
     SECURITY_QUALITY_OF_SERVICE securityQos;
     ALPC_PORT_CLIENT_APIS api;
     const LARGE_INTEGER *connectTimeout;
+    /* Optional handler for peer messages observed during a synchronous send. */
+    AlpcPort_IncomingRequestCallback onIncomingRequest;
+    PVOID incomingRequestContext;
 } ALPC_PORT_CLIENT_CONFIG, *PALPC_PORT_CLIENT_CONFIG;
 
 /** Client-owned state.  Do not modify fields after AlpcPort_Connect succeeds. */
@@ -474,6 +488,9 @@ typedef struct _ALPC_PORT_CLIENT_CONTEXT {
     /* Published with an interlocked store; zero means disconnected. */
     volatile LONG initialized;
     ALPC_PORT_CLIENT_APIS api;
+    /* Copied from config; invoked only while SendMessage owns receiveLock. */
+    AlpcPort_IncomingRequestCallback onIncomingRequest;
+    PVOID incomingRequestContext;
 } ALPC_PORT_CLIENT_CONTEXT, *PALPC_PORT_CLIENT_CONTEXT;
 
 /** Server creation settings; zero-initialize before use. */
@@ -501,7 +518,17 @@ typedef struct _ALPC_PORT_SERVER_CLIENT {
     uint32_t controlId;
     ALPC_PORT_LOCK receiveLock;
     ALPC_PORT_LIFETIME lifetime;
+    ALPC_PORT_MESSAGE currentRequest;
+    uint8_t currentRequestValid;
 } ALPC_PORT_SERVER_CLIENT, *PALPC_PORT_SERVER_CLIENT;
+
+/* Opaque-to-callers token identifying a request that was captured by a
+ * server callback.  The token is valid until AlpcPort_ServerReply returns. */
+typedef struct _ALPC_PORT_REPLY_TOKEN {
+    HANDLE clientPort;
+    ALPC_PORT_MESSAGE request;
+    uint8_t valid;
+} ALPC_PORT_REPLY_TOKEN, *PALPC_PORT_REPLY_TOKEN;
 
 /** Server-owned state; one context may service many communication ports. */
 typedef struct _ALPC_PORT_SERVER_CONTEXT {
@@ -513,6 +540,8 @@ typedef struct _ALPC_PORT_SERVER_CONTEXT {
     uint32_t clientCount;
     uint32_t maxClients;
     ALPC_PORT_LOCK lockWord;
+    /* Serializes receives from the shared connection queue. */
+    ALPC_PORT_LOCK connectionReceiveLock;
     ALPC_PORT_LIFETIME lifetime;
     /* Published with an interlocked store; zero means closed. */
     volatile LONG initialized;
@@ -532,10 +561,17 @@ extern "C" {
  *   AlpcPort_Register_ServerEvtCallback(&sx, &events);
  *   for (;;) AlpcPort_ProcessBlockedEventEx(&sx, &relativeTimeout);
  *
- * The onPostConnect callback receives each communication-port handle.  Hand
- * that handle to a worker and have the worker call
- * AlpcPort_ProcessClientEventEx(&sx, clientPort, &relativeTimeout).  A client
- * uses the analogous Connect -> SendMessage -> Disconnect sequence. */
+ * The onPostConnect callback receives each communication-port handle.  For a
+ * multi-process broker, one dispatcher may continue calling
+ * AlpcPort_ProcessBlockedEventEx: application frames arriving on the shared
+ * connection queue are routed by native ClientId.  The shared-queue path
+ * prefers an exact native process+thread ClientId match, allowing multiple
+ * endpoints from one process when each endpoint has a distinct originating
+ * thread; legacy providers that omit thread identity fall back to the
+ * dedicated accepted-port workers.  Alternatively, a legacy
+ * deployment may hand each handle to a worker and call
+ * AlpcPort_ProcessClientEventEx, but the two receive paths must not be mixed
+ * for the same endpoint. */
 
 /**
  * Creates the named ALPC connection port.  Fill the resolved API table and
@@ -559,9 +595,10 @@ uint8_t AlpcPort_Register_ServerEvtCallback(PALPC_PORT_SERVER_CONTEXT context,
                                              const ALPC_PORT_SERVER_EVENTS *events);
 
 /**
- * Waits indefinitely for one connection request on the server connection
- * port.  Accepted clients are reported through onPostConnect and must be
- * serviced with AlpcPort_ProcessClientEvent* (usually by a worker thread).
+ * Waits indefinitely for one connection or application frame on the server
+ * connection port.  Connection frames are reported through onPostConnect;
+ * application frames are routed by native ClientId and dispatched through
+ * onSyncRequest/onAsyncRequest.  Use one dispatcher for this shared queue.
  */
 NTSTATUS AlpcPort_ProcessBlockedEvent(PALPC_PORT_SERVER_CONTEXT context);
 
@@ -595,6 +632,19 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
 NTSTATUS AlpcPort_ServerDisconnectClient(PALPC_PORT_SERVER_CONTEXT context,
                                            HANDLE clientPort);
 
+/* Captures the current request while inside onSyncRequest.  Return
+ * STATUS_PENDING from that callback, enqueue the token, and later call
+ * AlpcPort_ServerReply to complete the request outside the receive thread. */
+NTSTATUS AlpcPort_ServerCaptureRequest(PALPC_PORT_SERVER_CONTEXT context,
+                                       HANDLE clientPort,
+                                       PALPC_PORT_REPLY_TOKEN token);
+NTSTATUS AlpcPort_ServerReply(PALPC_PORT_SERVER_CONTEXT context,
+                              PALPC_PORT_REPLY_TOKEN token,
+                              const void *payload,
+                              ULONG payloadLength,
+                              NTSTATUS requestStatus,
+                              const LARGE_INTEGER *timeout);
+
 /** Connects a client, optionally waiting only until connectTimeout expires. */
 NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
                           PALPC_PORT_CLIENT_CONTEXT context);
@@ -609,7 +659,9 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
  * reply callback still receives the payload), so transport success and
  * application failure remain distinguishable.  A
  * timed-out request may already have reached the server, so operations should
- * be idempotent when retrying.
+ * be idempotent when retrying.  If an incoming-request callback is configured,
+ * requests observed while waiting for the reply are serviced inline; that
+ * callback must not recursively send on this same client context.
  */
 NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                               const void *message,
@@ -619,6 +671,15 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                               AlpcPort_SyncReplyCallback replyCallback,
                               PVOID callbackContext,
                               const LARGE_INTEGER *timeout);
+
+/* Pins a client context while an application-owned receive is in flight.
+ * Pair every successful acquire with Release; Disconnect waits for these
+ * pins before closing the native handle. */
+uint8_t AlpcPort_ClientAcquire(PALPC_PORT_CLIENT_CONTEXT context);
+void AlpcPort_ClientRelease(PALPC_PORT_CLIENT_CONTEXT context);
+/* Serializes application-owned receives with synchronous SendMessage. */
+void AlpcPort_ClientReceiveLock(PALPC_PORT_CLIENT_CONTEXT context);
+void AlpcPort_ClientReceiveUnlock(PALPC_PORT_CLIENT_CONTEXT context);
 
 /** Closes the client communication port and releases its converted name.
  * Serialize Disconnect against new SendMessage calls.  A call already inside

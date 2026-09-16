@@ -1,0 +1,77 @@
+﻿#ifndef OS_VERSION_H
+#define OS_VERSION_H
+
+#ifdef _KERNEL_MODE
+#include <ntddk.h>
+#else
+#include <windows.h>
+#endif
+
+typedef enum _NTOS_VERSION
+{
+    WINDOWS_NONE,
+    WINDOWS_XP_SP3,
+    WINDOWS_2K3_SP2,
+    WINDOWS_VISTA_2008_RTM,
+    WINDOWS_VISTA_2008_SP1,
+    WINDOWS_VISTA_2008_SP2,
+    WINDOWS_7_2008R2_RTM,
+    WINDOWS_7_2008R2_SP1,
+    WINDOWS_8_2012_RTM,
+    WINDOWS_81_2012R2,
+    WINDOWS_81_2012R2_SP1,
+    WINDOWS_10_TH1,
+    WINDOWS_10_TH2,
+    WINDOWS_10_RS1,
+    WINDOWS_10_RS2,
+    WINDOWS_10_RS3,
+    WINDOWS_10_RS4,
+    WINDOWS_10_RS5,
+    WINDOWS_10_19H1,
+    WINDOWS_10_19H2,
+    WINDOWS_10_20H1,
+    WINDOWS_10_20H2,
+    WINDOWS_10_21H1,
+    WINDOWS_10_21H2,
+    WINDOWS_10_22H2,
+    WINDOWS_11_21H2,
+    WINDOWS_11_22H2,
+    WINDOWS_11_23H2,
+    WINDOWS_11_24H2,
+    WINDOWS_11_25H2,
+    WINDOWS_MAX_INDEX
+} NTOS_VERSION, * PNTOS_VERSION;
+
+#define OSVER_IS_WIN7_LOWER(__XX__) ((__XX__) < (WINDOWS_7_2008R2_RTM))
+#define OSVER_IS_WIN8_LOWER(__XX__) ((__XX__) < (WINDOWS_8_2012_RTM))
+#define OSVER_IS_WIN81_LOWER(__XX__) ((__XX__) < (WINDOWS_81_2012R2))
+#define OSVER_IS_WIN10_LOWER(__XX__) ((__XX__) < (WINDOWS_10_TH1))
+#define OSVER_IS_WIN11_LOWER(__XX__) ((__XX__) < (WINDOWS_11_21H2))
+
+#define OSVER_IS_VISTA(__XX__) (((__XX__) >= WINDOWS_VISTA_2008_RTM) && ((__XX__) <= WINDOWS_VISTA_2008_SP2))
+#define OSVER_IS_WIN7(__XX__) (((__XX__) >= WINDOWS_7_2008R2_RTM) && ((__XX__) <= WINDOWS_7_2008R2_SP1))
+#define OSVER_IS_WIN8(__XX__) ((__XX__) == WINDOWS_8_2012_RTM)
+#define OSVER_IS_WIN81(__XX__) (((__XX__) >= WINDOWS_81_2012R2) && ((__XX__) <= WINDOWS_81_2012R2_SP1))
+#define OSVER_IS_WIN10(__XX__) (((__XX__) >= WINDOWS_10_TH1) && ((__XX__) <= WINDOWS_10_22H2))
+#define OSVER_IS_WIN11(__XX__) (((__XX__) >= WINDOWS_11_21H2) && ((__XX__) <= WINDOWS_11_25H2))
+
+#ifndef OS_VERSION_API
+#define OS_VERSION_API
+#endif
+
+#ifndef OS_VERSION_CALL
+#define OS_VERSION_CALL
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+OS_VERSION_API NTOS_VERSION OS_VERSION_CALL 
+OSVersion_ParseOsInfo2Version(OSVERSIONINFOEXW NtosInfo);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif // OS_VERSION_H

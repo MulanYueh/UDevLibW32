@@ -55,6 +55,9 @@
 #ifndef STATUS_INSUFFICIENT_RESOURCES
 #  define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)(LONG)0xC000009AUL)
 #endif
+#ifndef STATUS_INTEGER_OVERFLOW
+#  define STATUS_INTEGER_OVERFLOW ((NTSTATUS)(LONG)0xC0000095UL)
+#endif
 #ifndef STATUS_NOT_SUPPORTED
 #  define STATUS_NOT_SUPPORTED ((NTSTATUS)(LONG)0xC00000BBUL)
 #endif
@@ -84,8 +87,44 @@
  * its address suitably aligned for LPC_PORT_MESSAGE on 64-bit builds. */
 typedef union _LPC_MESSAGE_BUFFER {
     LPC_HEADER alignment;
+    LPC_HEADER64 alignment64;
     UCHAR bytes[LPC_PORT_BUFFER_SIZE];
 } LPC_MESSAGE_BUFFER;
+
+typedef char LPC_PORT_MESSAGE64_size_must_be_40[
+    sizeof(LPC_PORT_MESSAGE64) == 40U ? 1 : -1];
+typedef char LPC_PORT_VIEW64_size_must_be_48[
+    sizeof(LPC_PORT_VIEW64) == 48U ? 1 : -1];
+typedef char LPC_REMOTE_PORT_VIEW64_size_must_be_24[
+    sizeof(LPC_REMOTE_PORT_VIEW64) == 24U ? 1 : -1];
+typedef char LPC_HEADER64_data_offset_must_be_48[
+    LPC_HEADER64_DATA_OFFSET == 48U ? 1 : -1];
+
+#if defined(_WIN64) || defined(_M_AMD64) || defined(__x86_64__) || \
+    defined(__amd64__) || defined(_M_ARM64) || defined(__aarch64__)
+typedef char LPC_PORT_MESSAGE_native_size_must_be_40[
+    sizeof(LPC_PORT_MESSAGE) == 40U ? 1 : -1];
+typedef char LPC_PORT_VIEW_native_size_must_be_48[
+    sizeof(LPC_PORT_VIEW) == 48U ? 1 : -1];
+typedef char LPC_REMOTE_PORT_VIEW_native_size_must_be_24[
+    sizeof(LPC_REMOTE_PORT_VIEW) == 24U ? 1 : -1];
+typedef char LPC_HEADER_native_data_offset_must_be_48[
+    LPC_HEADER_DATA_OFFSET == 48U ? 1 : -1];
+#else
+typedef char LPC_PORT_MESSAGE_native_size_must_be_24[
+    sizeof(LPC_PORT_MESSAGE) == 24U ? 1 : -1];
+typedef char LPC_PORT_VIEW_native_size_must_be_24[
+    sizeof(LPC_PORT_VIEW) == 24U ? 1 : -1];
+typedef char LPC_REMOTE_PORT_VIEW_native_size_must_be_12[
+    sizeof(LPC_REMOTE_PORT_VIEW) == 12U ? 1 : -1];
+typedef char LPC_HEADER_native_data_offset_must_be_32[
+    LPC_HEADER_DATA_OFFSET == 32U ? 1 : -1];
+#endif
+
+#define LPC_PROCESS_WOW64_INFORMATION 26U
+#define LPC_WIRE_OPTION_SHARED_MEMORY 0x00000001UL
+#define LPC_WIRE_OPTION_ASYNC         0x00000002UL
+#define LPC_WIRE_OPTION_RESERVED      0xfffffffcUL
 
 /* Context shutdown can race event-loop and send threads.  Keep the public
  * context layout simple, but publish its state with acquire/release atomics
@@ -136,6 +175,54 @@ static int lpc_state_claim_close(volatile LONG *state)
 {
     return state != (volatile LONG *)0 &&
            lpc_state_compare_exchange(state, 1, 0) == 1;
+}
+
+/* User-mode lifetime objects contain a CriticalSection that is deleted during
+ * shutdown.  Serialize the short admission/destruction window globally so a
+ * thread that observed the published context state immediately before close
+ * cannot enter a deleted synchronization object.  Per-object active counts
+ * still provide the actual rundown and this gate is never held across native
+ * LPC calls, callbacks, or waits. */
+static volatile LONG g_lpc_lifetime_admission = 0;
+/* Native LPC stores PortContext as one pointer-sized opaque value.  Allocate
+ * it from a process/module-wide sequence so server recreation, allocator
+ * address reuse, and HANDLE reuse cannot make a delayed message name a new
+ * endpoint.  Values are consumed even when a later accept step fails. */
+static SIZE_T g_lpc_endpoint_token = 0;
+
+static void lpc_lifetime_global_lock(void)
+{
+    while (lpc_state_compare_exchange(&g_lpc_lifetime_admission, 0, 1) != 0) {
+#if defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
+        KeYieldProcessor();
+#elif defined(_MSC_VER)
+        YieldProcessor();
+#endif
+    }
+}
+
+static void lpc_lifetime_global_unlock(void)
+{
+    lpc_state_store(&g_lpc_lifetime_admission, 0);
+}
+
+static NTSTATUS lpc_next_endpoint_token(PVOID *token)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!token) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    *token = NULL;
+    lpc_lifetime_global_lock();
+    if (g_lpc_endpoint_token == (SIZE_T)-1) {
+        status = STATUS_INTEGER_OVERFLOW;
+    } else {
+        ++g_lpc_endpoint_token;
+        *token = (PVOID)(ULONG_PTR)g_lpc_endpoint_token;
+    }
+    lpc_lifetime_global_unlock();
+    return status;
 }
 
 static int lpc_lock_init(LPC_PORT_LOCK *lock)
@@ -273,6 +360,11 @@ static int lpc_lifetime_init(LPC_PORT_LIFETIME *life)
     if (!life) {
         return 0;
     }
+    lpc_lifetime_global_lock();
+    if (life->initialized) {
+        lpc_lifetime_global_unlock();
+        return 0;
+    }
 #if defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
     ExInitializeRundownProtection(&life->rundown);
     life->admission = 0;
@@ -290,48 +382,48 @@ static int lpc_lifetime_init(LPC_PORT_LIFETIME *life)
     life->closing = 0;
     life->initialized = 1;
 #endif
+    lpc_lifetime_global_unlock();
     return 1;
 }
 
 static int lpc_lifetime_acquire(LPC_PORT_LIFETIME *life)
 {
-    if (!life || !life->initialized) {
+    int acquired = 0;
+
+    if (!life) {
+        return 0;
+    }
+    lpc_lifetime_global_lock();
+    if (!life->initialized) {
+        lpc_lifetime_global_unlock();
         return 0;
     }
 #if defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
-    {
-        int acquired = 0;
-        lpc_lifetime_admission_lock(life);
-        if (life->initialized && life->closing == 0 &&
-            ExAcquireRundownProtection(&life->rundown)) {
-            acquired = 1;
-        }
-        lpc_lifetime_admission_unlock(life);
-        return acquired;
+    lpc_lifetime_admission_lock(life);
+    if (life->initialized && life->closing == 0 &&
+        ExAcquireRundownProtection(&life->rundown)) {
+        acquired = 1;
     }
+    lpc_lifetime_admission_unlock(life);
 #elif !defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
-    {
-        int acquired = 0;
-        EnterCriticalSection(&life->native);
-        if (life->initialized && !life->closing) {
-            ++life->active;
-            acquired = 1;
-        }
-        LeaveCriticalSection(&life->native);
-        return acquired;
+    EnterCriticalSection(&life->native);
+    if (life->initialized && !life->closing &&
+        life->active != ~(uint32_t)0) {
+        ++life->active;
+        acquired = 1;
     }
+    LeaveCriticalSection(&life->native);
 #else
-    {
-        int acquired = 0;
-        lpc_lifetime_fallback_lock(life);
-        if (life->initialized && !life->closing) {
-            ++life->active;
-            acquired = 1;
-        }
-        lpc_lifetime_fallback_unlock(life);
-        return acquired;
+    lpc_lifetime_fallback_lock(life);
+    if (life->initialized && !life->closing &&
+        life->active != ~(uint32_t)0) {
+        ++life->active;
+        acquired = 1;
     }
+    lpc_lifetime_fallback_unlock(life);
 #endif
+    lpc_lifetime_global_unlock();
+    return acquired;
 }
 
 static void lpc_lifetime_release(LPC_PORT_LIFETIME *life)
@@ -363,7 +455,12 @@ static void lpc_lifetime_release(LPC_PORT_LIFETIME *life)
  * window between a caller's state check and its lifetime pin. */
 static void lpc_lifetime_mark_closing(LPC_PORT_LIFETIME *life)
 {
-    if (!life || !life->initialized) {
+    if (!life) {
+        return;
+    }
+    lpc_lifetime_global_lock();
+    if (!life->initialized) {
+        lpc_lifetime_global_unlock();
         return;
     }
 #if defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
@@ -379,6 +476,7 @@ static void lpc_lifetime_mark_closing(LPC_PORT_LIFETIME *life)
     life->closing = 1;
     lpc_lifetime_fallback_unlock(life);
 #endif
+    lpc_lifetime_global_unlock();
 }
 
 /* Drain pins after the native handle has been disconnected/closed. */
@@ -416,28 +514,77 @@ static void lpc_lifetime_destroy(LPC_PORT_LIFETIME *life)
     if (!life) {
         return;
     }
+    lpc_lifetime_global_lock();
 #if !defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
     if (life->initialized) {
         DeleteCriticalSection(&life->native);
     }
 #endif
     life->initialized = 0;
+    lpc_lifetime_global_unlock();
 }
 
 static int lpc_client_api_valid(const LPC_CLIENT_APIS *api) {
-    return api && api->pfnRtlInitAnsiString && api->pfnNtCreateSection &&
+    int valid = api && api->pfnRtlInitAnsiString && api->pfnNtCreateSection &&
            api->pfnNtConnectPort && api->pfnNtClose &&
            api->pfnRtlAnsiStringToUnicodeString && api->pfnRtlFreeUnicodeString &&
            api->pfnNtRequestPort && api->pfnNtRequestWaitReplyPort;
+#if !defined(_WIN64) && !defined(_M_AMD64) && !defined(__x86_64__) && \
+    !defined(_M_ARM64) && !defined(__aarch64__) && !defined(_KERNEL_MODE)
+    valid = valid && api && api->pfnNtQueryInformationProcess;
+#endif
+    return valid;
 }
 
 static int lpc_server_api_valid(const LPC_SERVER_APIS *api) {
-    return api && api->pfnRtlInitAnsiString && api->pfnNtCreatePort &&
+    int valid = api && api->pfnRtlInitAnsiString && api->pfnNtCreatePort &&
            api->pfnNtClose && api->pfnRtlAnsiStringToUnicodeString &&
            api->pfnRtlFreeUnicodeString &&
            (api->pfnNtReplyWaitReceivePort || api->pfnNtReplyWaitReceivePortEx) &&
            api->pfnNtAcceptConnectPort && api->pfnNtCompleteConnectPort &&
            api->pfnNtReplyPort;
+#if !defined(_WIN64) && !defined(_M_AMD64) && !defined(__x86_64__) && \
+    !defined(_M_ARM64) && !defined(__aarch64__) && !defined(_KERNEL_MODE)
+    valid = valid && api && api->pfnNtQueryInformationProcess;
+#endif
+    return valid;
+}
+
+static NTSTATUS lpc_detect_64bit_wire(
+    typedef_NtQueryInformationProcess queryInformationProcess,
+    uint8_t *use64BitWire)
+{
+    if (!use64BitWire) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+#if defined(_WIN64) || defined(_M_AMD64) || defined(__x86_64__) || \
+    defined(_M_ARM64) || defined(__aarch64__)
+    (void)queryInformationProcess;
+    *use64BitWire = 1U;
+    return STATUS_SUCCESS;
+#elif defined(_KERNEL_MODE)
+    (void)queryInformationProcess;
+    *use64BitWire = 0U;
+    return STATUS_SUCCESS;
+#else
+    {
+        ULONG_PTR wow64Peb = 0U;
+        NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+        if (!queryInformationProcess) {
+            return STATUS_NOT_SUPPORTED;
+        }
+        status = queryInformationProcess(
+            (HANDLE)(ULONG_PTR)(SIZE_T)-1,
+            (ULONG)LPC_PROCESS_WOW64_INFORMATION,
+            &wow64Peb, (ULONG)sizeof(wow64Peb), NULL);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        *use64BitWire = wow64Peb != 0U ? 1U : 0U;
+        return STATUS_SUCCESS;
+    }
+#endif
 }
 
 static int lpc_port_name_valid(const LPC_PORT_NAME *name) {
@@ -450,39 +597,188 @@ static int lpc_port_name_valid(const LPC_PORT_NAME *name) {
     return length > 0 && length < sizeof(name->name);
 }
 
-static void lpc_init_port_message(PLPC_PORT_MESSAGE message, size_t totalLength, USHORT type) {
-    if (!message || totalLength < sizeof(LPC_PORT_MESSAGE) || totalLength > 0xffffU) {
+static size_t lpc_wire_port_message_size(uint8_t use64BitWire)
+{
+    return use64BitWire ? sizeof(LPC_PORT_MESSAGE64)
+                        : sizeof(LPC_PORT_MESSAGE);
+}
+
+static size_t lpc_wire_data_offset(uint8_t use64BitWire)
+{
+    return use64BitWire ? LPC_HEADER64_DATA_OFFSET
+                        : LPC_HEADER_DATA_OFFSET;
+}
+
+static size_t lpc_wire_inline_capacity(uint8_t use64BitWire)
+{
+    size_t offset = lpc_wire_data_offset(use64BitWire);
+    size_t capacity = 0U;
+
+    if ((size_t)LPC_PORT_BUFFER_SIZE <= offset + sizeof(ULONG)) {
+        return 0U;
+    }
+    capacity = (size_t)LPC_PORT_BUFFER_SIZE - offset - sizeof(ULONG);
+    return capacity < (size_t)LPC_MESSAGE_MAX_PACK_SIZE
+               ? capacity : (size_t)LPC_MESSAGE_MAX_PACK_SIZE;
+}
+
+static size_t lpc_client_inline_capacity(const LPC_CLIENT_CONTEXT *context)
+{
+    size_t localCapacity = 0U;
+    size_t dataOffset = 0U;
+    size_t peerCapacity = 0U;
+
+    if (!context) {
+        return 0U;
+    }
+    localCapacity = lpc_wire_inline_capacity(context->use64BitWire);
+    dataOffset = lpc_wire_data_offset(context->use64BitWire);
+    if ((size_t)context->negotiatedMaxMessageLength <
+        dataOffset + sizeof(ULONG)) {
+        return 0U;
+    }
+    peerCapacity = (size_t)context->negotiatedMaxMessageLength -
+                   dataOffset - sizeof(ULONG);
+    return peerCapacity < localCapacity ? peerCapacity : localCapacity;
+}
+
+static PLPC_PORT_MESSAGE lpc_wire_native_message(PVOID frame)
+{
+    return (PLPC_PORT_MESSAGE)frame;
+}
+
+static USHORT lpc_wire_data_length(const void *frame, uint8_t use64BitWire)
+{
+    if (use64BitWire) {
+        return ((const LPC_PORT_MESSAGE64 *)frame)->u1.s1.DataLength;
+    }
+    return ((const LPC_PORT_MESSAGE *)frame)->u1.s1.DataLength;
+}
+
+static USHORT lpc_wire_total_length(const void *frame, uint8_t use64BitWire)
+{
+    if (use64BitWire) {
+        return ((const LPC_PORT_MESSAGE64 *)frame)->u1.s1.TotalLength;
+    }
+    return ((const LPC_PORT_MESSAGE *)frame)->u1.s1.TotalLength;
+}
+
+static USHORT lpc_wire_raw_type(const void *frame, uint8_t use64BitWire)
+{
+    if (use64BitWire) {
+        return ((const LPC_PORT_MESSAGE64 *)frame)->u2.s2.Type;
+    }
+    return ((const LPC_PORT_MESSAGE *)frame)->u2.s2.Type;
+}
+
+static USHORT lpc_wire_message_type(const void *frame, uint8_t use64BitWire)
+{
+    return (USHORT)(lpc_wire_raw_type(frame, use64BitWire) & 0x0fffU);
+}
+
+static void lpc_wire_set_lengths(void *frame, uint8_t use64BitWire,
+                                 USHORT dataLength, USHORT totalLength)
+{
+    if (use64BitWire) {
+        PLPC_PORT_MESSAGE64 message = (PLPC_PORT_MESSAGE64)frame;
+        message->u1.s1.DataLength = dataLength;
+        message->u1.s1.TotalLength = totalLength;
+    } else {
+        PLPC_PORT_MESSAGE message = (PLPC_PORT_MESSAGE)frame;
+        message->u1.s1.DataLength = dataLength;
+        message->u1.s1.TotalLength = totalLength;
+    }
+}
+
+static void lpc_wire_set_type(void *frame, uint8_t use64BitWire, USHORT type)
+{
+    if (use64BitWire) {
+        PLPC_PORT_MESSAGE64 message = (PLPC_PORT_MESSAGE64)frame;
+        message->u2.s2.Type = type;
+        message->u2.s2.DataInfoOffset = 0U;
+    } else {
+        PLPC_PORT_MESSAGE message = (PLPC_PORT_MESSAGE)frame;
+        message->u2.s2.Type = type;
+        message->u2.s2.DataInfoOffset = 0U;
+    }
+}
+
+static ULONG lpc_wire_control_id(const void *frame, uint8_t use64BitWire)
+{
+    const ULONG *controlId = (const ULONG *)(const void *)(
+        (const UCHAR *)frame + lpc_wire_port_message_size(use64BitWire));
+    return *controlId;
+}
+
+static void lpc_wire_set_control_id(void *frame, uint8_t use64BitWire,
+                                    ULONG value)
+{
+    ULONG *controlId = (ULONG *)(void *)(
+        (UCHAR *)frame + lpc_wire_port_message_size(use64BitWire));
+    *controlId = value;
+}
+
+static ULONG lpc_wire_options(const void *frame, uint8_t use64BitWire)
+{
+    const ULONG *options = (const ULONG *)(const void *)(
+        (const UCHAR *)frame + lpc_wire_port_message_size(use64BitWire) +
+        sizeof(ULONG));
+    return *options;
+}
+
+static void lpc_wire_set_options(void *frame, uint8_t use64BitWire,
+                                 ULONG value)
+{
+    ULONG *options = (ULONG *)(void *)(
+        (UCHAR *)frame + lpc_wire_port_message_size(use64BitWire) +
+        sizeof(ULONG));
+    *options = value;
+}
+
+static UCHAR *lpc_wire_data(void *frame, uint8_t use64BitWire)
+{
+    return (UCHAR *)frame + lpc_wire_data_offset(use64BitWire);
+}
+
+static void lpc_init_port_message(void *message, uint8_t use64BitWire,
+                                  size_t totalLength, USHORT type) {
+    size_t nativeHeaderSize = lpc_wire_port_message_size(use64BitWire);
+
+    if (!message || totalLength < nativeHeaderSize || totalLength > 0xffffU) {
         return;
     }
 
-    libc_memset(message, 0, sizeof(*message));
-    message->u1.s1.TotalLength = (USHORT)totalLength;
-    message->u1.s1.DataLength = (USHORT)(totalLength - sizeof(LPC_PORT_MESSAGE));
-    message->u2.s2.Type = type;
+    libc_memset(message, 0, nativeHeaderSize);
+    lpc_wire_set_lengths(message, use64BitWire,
+                         (USHORT)(totalLength - nativeHeaderSize),
+                         (USHORT)totalLength);
+    lpc_wire_set_type(message, use64BitWire, type);
 }
 
-static int lpc_port_message_valid(const PLPC_PORT_MESSAGE message, size_t bufferSize,
-                                  size_t minimumLength) {
+static int lpc_port_message_valid(const void *message, uint8_t use64BitWire,
+                                  size_t bufferSize, size_t minimumLength) {
     size_t totalLength = 0;
+    size_t nativeHeaderSize = lpc_wire_port_message_size(use64BitWire);
 
     if (!message) {
         return 0;
     }
-    totalLength = message->u1.s1.TotalLength;
-    return totalLength >= sizeof(LPC_PORT_MESSAGE) && totalLength >= minimumLength &&
+    totalLength = lpc_wire_total_length(message, use64BitWire);
+    return totalLength >= nativeHeaderSize && totalLength >= minimumLength &&
            totalLength <= bufferSize &&
-           message->u1.s1.DataLength == totalLength - sizeof(LPC_PORT_MESSAGE);
+           lpc_wire_data_length(message, use64BitWire) ==
+               totalLength - nativeHeaderSize;
 }
 
 /* Build a protocol-valid empty inline reply.  LPC has no status field in the
  * wire payload, but replying is still important: a malformed synchronous
  * request must not leave its caller blocked forever in NtRequestWaitReplyPort. */
-static int lpc_prepare_empty_reply(PLPC_HEADER header, size_t bufferSize)
+static int lpc_prepare_empty_reply(void *header, uint8_t use64BitWire,
+                                   size_t bufferSize)
 {
-    LPC_PORT_MESSAGE nativeHeader = LPC_PORT_ZERO_INIT;
     PLPC_MESSAGE message = (PLPC_MESSAGE)0;
-    size_t totalLength = LPC_HEADER_DATA_OFFSET + sizeof(ULONG);
-    uint8_t useSharedMemory = 0;
+    size_t totalLength = lpc_wire_data_offset(use64BitWire) + sizeof(ULONG);
+    ULONG options = 0U;
 
     if (!header || bufferSize < totalLength) {
         return 0;
@@ -490,22 +786,20 @@ static int lpc_prepare_empty_reply(PLPC_HEADER header, size_t bufferSize)
     /* Keep the MessageId/ClientId fields generated by the kernel.  Rebuilding
      * the whole PORT_MESSAGE with lpc_init_port_message would erase them and
      * NtReplyPort could no longer match this reply to its waiting sender. */
-    nativeHeader = header->header;
-    useSharedMemory = header->u1.s1.ulUseSharedMemory ? 1U : 0U;
-    message = (PLPC_MESSAGE)(void *)header->data;
+    options = lpc_wire_options(header, use64BitWire) &
+              LPC_WIRE_OPTION_SHARED_MEMORY;
+    message = (PLPC_MESSAGE)(void *)lpc_wire_data(header, use64BitWire);
     libc_memset(message, 0, sizeof(ULONG));
     /* Preserve the transport mode so a shared-memory caller does not parse an
      * inline error envelope as a reply from a different storage area. */
-    header->u1.s1.ulUseSharedMemory = useSharedMemory != 0U;
-    header->u1.s1.ulUseAsyncMethod = 0;
-    header->u1.s1.ulReserved = 0;
-    header->header = nativeHeader;
-    header->header.u1.s1.TotalLength = (USHORT)totalLength;
-    header->header.u1.s1.DataLength =
-        (USHORT)(totalLength - sizeof(LPC_PORT_MESSAGE));
-    header->header.u2.s2.Type = (USHORT)LPC_TYPE_REPLY;
-    header->header.u2.s2.DataInfoOffset = 0;
-    return lpc_port_message_valid(&header->header, bufferSize, totalLength);
+    lpc_wire_set_options(header, use64BitWire, options);
+    lpc_wire_set_lengths(
+        header, use64BitWire,
+        (USHORT)(totalLength - lpc_wire_port_message_size(use64BitWire)),
+        (USHORT)totalLength);
+    lpc_wire_set_type(header, use64BitWire, (USHORT)LPC_TYPE_REPLY);
+    return lpc_port_message_valid(header, use64BitWire, bufferSize,
+                                  totalLength);
 }
 
 static void lpc_clear_shared_memory(const PLPC_SERVER_CLIENT_INFO client)
@@ -525,11 +819,13 @@ static void lpc_clear_shared_memory(const PLPC_SERVER_CLIENT_INFO client)
  * reject path for every malformed request that still has a valid PORT_MESSAGE
  * type field; the returned handle is only a transient reject handle. */
 static NTSTATUS lpc_reject_connection(const LPC_SERVER_CONTEXT *context,
-                                       PLPC_PORT_MESSAGE request)
+                                       void *request)
 {
-    LPC_PORT_MESSAGE normalized = LPC_PORT_ZERO_INIT;
+    LPC_MESSAGE_BUFFER normalized = LPC_PORT_ZERO_INIT;
     HANDLE rejectedHandle = NULL;
     NTSTATUS status = STATUS_DATA_ERROR;
+    size_t nativeHeaderSize = 0U;
+    size_t totalLength = 0U;
 
     if (!context || !request || !context->hLPCPortServerHandle ||
         !context->api.pfnNtAcceptConnectPort) {
@@ -540,37 +836,42 @@ static NTSTATUS lpc_reject_connection(const LPC_SERVER_CONTEXT *context,
      * fields but normalize the user-controlled length/type fields so a
      * truncated request can be rejected instead of leaving NtConnectPort
      * pending forever. */
-    normalized = *request;
-    normalized.u1.s1.TotalLength =
-        (USHORT)(sizeof(LPC_PORT_MESSAGE) + sizeof(uint32_t));
-    normalized.u1.s1.DataLength = (USHORT)sizeof(uint32_t);
-    normalized.u2.s2.Type = (USHORT)LPC_TYPE_CONNECTION_REQUEST;
-    normalized.u2.s2.DataInfoOffset = 0;
+    nativeHeaderSize = lpc_wire_port_message_size(context->use64BitWire);
+    totalLength = nativeHeaderSize + sizeof(uint32_t);
+    libc_memcpy(normalized.bytes, request, nativeHeaderSize);
+    lpc_wire_set_lengths(normalized.bytes, context->use64BitWire,
+                         (USHORT)sizeof(uint32_t), (USHORT)totalLength);
+    lpc_wire_set_type(normalized.bytes, context->use64BitWire,
+                      (USHORT)LPC_TYPE_CONNECTION_REQUEST);
     status = context->api.pfnNtAcceptConnectPort(
-        &rejectedHandle, NULL, &normalized, (BOOLEAN)0, NULL, NULL);
+        &rejectedHandle, NULL, lpc_wire_native_message(normalized.bytes),
+        (BOOLEAN)0, NULL, NULL);
     if (rejectedHandle && context->api.pfnNtClose) {
         (void)context->api.pfnNtClose(rejectedHandle);
     }
     return status;
 }
 
-static int lpc_inline_message(const PLPC_HEADER header, size_t bufferSize,
-                              PLPC_MESSAGE *message, size_t *available) {
+static int lpc_inline_message(void *header, uint8_t use64BitWire,
+                              size_t bufferSize, PLPC_MESSAGE *message,
+                              size_t *available) {
     size_t payloadLength = 0;
+    size_t dataOffset = lpc_wire_data_offset(use64BitWire);
     PLPC_MESSAGE localMessage = NULL;
 
     if (!header ||
-        !lpc_port_message_valid(&header->header, bufferSize, LPC_HEADER_DATA_OFFSET + sizeof(ULONG))) {
+        !lpc_port_message_valid(header, use64BitWire, bufferSize,
+                                dataOffset + sizeof(ULONG))) {
         return 0;
     }
 
-    payloadLength = header->header.u1.s1.TotalLength - LPC_HEADER_DATA_OFFSET;
+    payloadLength = lpc_wire_total_length(header, use64BitWire) - dataOffset;
     if (payloadLength < sizeof(ULONG)) {
         return 0;
     }
-    localMessage = (PLPC_MESSAGE)(void *)header->data;
+    localMessage = (PLPC_MESSAGE)(void *)lpc_wire_data(header, use64BitWire);
     if ((size_t)localMessage->size > payloadLength - sizeof(ULONG) ||
-        localMessage->size > LPC_MESSAGE_MAX_PACK_SIZE) {
+        (size_t)localMessage->size > lpc_wire_inline_capacity(use64BitWire)) {
         return 0;
     }
     if ((size_t)localMessage->size != payloadLength - sizeof(ULONG)) {
@@ -599,9 +900,10 @@ static int lpc_shared_message(const PLPC_SHARED_MEMORY shared, SIZE_T viewSize,
     return 1;
 }
 
-/* NtReplyWaitReceivePort returns the PortContext supplied to
- * NtAcceptConnectPort, not the communication-port handle.  Match both forms
- * so resolver test doubles that return a handle remain usable. */
+/* NtReplyWaitReceivePort returns the opaque PortContext supplied to
+ * NtAcceptConnectPort.  Match only that token: accepting a record address or
+ * communication-port HANDLE here would reintroduce an ABA route when either
+ * value is released and later reused. */
 static PLPC_SERVER_CLIENT_INFO lpc_acquire_client_by_context(
     PLPC_SERVER_CONTEXT context, PVOID portContext)
 {
@@ -614,8 +916,7 @@ static PLPC_SERVER_CLIENT_INFO lpc_acquire_client_by_context(
     for (current = (PLPC_SERVER_CLIENT_INFO)List_Head(&context->clientList);
          current;
          current = (PLPC_SERVER_CLIENT_INFO)List_Next(&current->listEntry)) {
-        if ((PVOID)current == portContext ||
-            current->hLPCPortClientHandle == (HANDLE)portContext) {
+        if (current->portContextToken == portContext) {
             if (!lpc_lifetime_acquire(&current->lifetime)) {
                 current = NULL;
             }
@@ -658,7 +959,7 @@ static PLPC_SERVER_CLIENT_INFO lpc_detach_client(PLPC_SERVER_CONTEXT context, HA
 static int lpc_add_client(PLPC_SERVER_CONTEXT context, PLPC_SERVER_CLIENT_INFO info) {
     PLPC_SERVER_CLIENT_INFO current = NULL;
 
-    if (!context || !info) {
+    if (!context || !info || !info->portContextToken) {
         return 0;
     }
     if (!info->lifetime.initialized && !lpc_lifetime_init(&info->lifetime)) {
@@ -678,7 +979,8 @@ static int lpc_add_client(PLPC_SERVER_CONTEXT context, PLPC_SERVER_CLIENT_INFO i
     for (current = (PLPC_SERVER_CLIENT_INFO)List_Head(&context->clientList);
          current;
          current = (PLPC_SERVER_CLIENT_INFO)List_Next(&current->listEntry)) {
-        if (current->hLPCPortClientHandle == info->hLPCPortClientHandle) {
+        if (current->hLPCPortClientHandle == info->hLPCPortClientHandle ||
+            current->portContextToken == info->portContextToken) {
             lpc_lock_release(&context->lockWord);
             lpc_lock_destroy(&info->receiveLock);
             lpc_lifetime_destroy(&info->lifetime);
@@ -744,17 +1046,17 @@ static NTSTATUS lpc_drop_client(PLPC_SERVER_CONTEXT context,
     if (context->api.pfnNtClose && client->hLPCPortClientHandle) {
         (void)context->api.pfnNtClose(client->hLPCPortClientHandle);
     }
-    /* Closing wakes a receive blocked in the Native API.  Take the callback
-     * lock only after the wake-up: a worker pins the client lifetime before
-     * waiting for receiveLock and may otherwise be asleep in the Native call. */
-    lpc_lock_acquire(&client->receiveLock);
-    /* The callback receives the endpoint value for identification; LPC has no
-     * disconnect primitive, so the native handle may already be closed here. */
+    /* Closing wakes a receive blocked in the Native API.  Drain every worker
+     * before publishing the close notification.  A worker takes its lifetime
+     * pin before receiveLock, so waiting for rundown while holding that lock
+     * would deadlock a worker that has already been admitted. */
+    lpc_lifetime_wait(&client->lifetime);
+    /* No request callback can run after rundown completes.  The callback gets
+     * the saved endpoint value for identification; LPC has no disconnect
+     * primitive, so the native handle is already closed at this point. */
     if (notify && events.onClose) {
         events.onClose(clientHandle);
     }
-    lpc_lock_release(&client->receiveLock);
-    lpc_lifetime_wait(&client->lifetime);
     lpc_close_client_info(client);
     return STATUS_SUCCESS;
 }
@@ -789,6 +1091,8 @@ static void lpc_reset_client_context(PLPC_CLIENT_CONTEXT context) {
         context->hSectionHandle = NULL;
         libc_memset(&context->ustrLPCName, 0, sizeof(context->ustrLPCName));
         libc_memset(&context->client_view, 0, sizeof(context->client_view));
+        context->use64BitWire = 0U;
+        context->negotiatedMaxMessageLength = 0U;
         libc_memset(&context->api, 0, sizeof(context->api));
         lpc_state_store(&context->initialized, 0);
     }
@@ -802,6 +1106,7 @@ static void lpc_reset_server_context(PLPC_SERVER_CONTEXT context) {
         libc_memset(&context->clientList, 0, sizeof(context->clientList));
         context->clientCount = 0;
         context->maxClients = 0;
+        context->use64BitWire = 0U;
         libc_memset(&context->api, 0, sizeof(context->api));
         lpc_state_store(&context->initialized, 0);
     }
@@ -826,6 +1131,13 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
     if (!lpc_server_api_valid(&context->api)) {
         lpc_reset_server_context(context);
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    status = lpc_detect_64bit_wire(
+        context->api.pfnNtQueryInformationProcess,
+        &context->use64BitWire);
+    if (!NT_SUCCESS(status)) {
+        lpc_reset_server_context(context);
+        return status;
     }
     if (!lpc_lifetime_init(&context->lifetime)) {
         lpc_reset_server_context(context);
@@ -891,6 +1203,8 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     ULONG controlId = 0;
     ULONG controlIdLength = 0;
     ULONG maxMessageLength = 0;
+    LPC_PORT_VIEW64 clientView64 = LPC_PORT_ZERO_INIT;
+    PLPC_PORT_VIEW nativeClientView = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     if (!config || !context || !lpc_port_name_valid(&config->LpcName)) {
@@ -906,6 +1220,13 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     if (!lpc_client_api_valid(&context->api)) {
         lpc_reset_client_context(context);
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    status = lpc_detect_64bit_wire(
+        context->api.pfnNtQueryInformationProcess,
+        &context->use64BitWire);
+    if (!NT_SUCCESS(status)) {
+        lpc_reset_client_context(context);
+        return status;
     }
     if (!lpc_lifetime_init(&context->lifetime)) {
         lpc_reset_client_context(context);
@@ -952,11 +1273,23 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     context->client_view.ViewSize = (SIZE_T)LPC_SECTION_MAX_SPACE_SIZE;
     context->client_view.ViewBase = NULL;
     context->client_view.ViewRemoteBase = NULL;
+    if (context->use64BitWire) {
+        clientView64.Length = (ULONG)sizeof(clientView64);
+        clientView64.SectionHandle =
+            (uint64_t)(ULONG_PTR)context->hSectionHandle;
+        clientView64.SectionOffset = 0U;
+        clientView64.ViewSize = (uint64_t)LPC_SECTION_MAX_SPACE_SIZE;
+        clientView64.ViewBase = 0U;
+        clientView64.ViewRemoteBase = 0U;
+        nativeClientView = (PLPC_PORT_VIEW)(void *)&clientView64;
+    } else {
+        nativeClientView = &context->client_view;
+    }
 
     controlId = config->HelloId;
     controlIdLength = (ULONG)sizeof(controlId);
     status = context->api.pfnNtConnectPort(&context->hLPCPortHandle, &context->ustrLPCName,
-                                           &securityQos, &context->client_view, NULL,
+                                           &securityQos, nativeClientView, NULL,
                                            &maxMessageLength, &controlId, &controlIdLength);
     if (!NT_SUCCESS(status) || !context->hLPCPortHandle) {
         if (NT_SUCCESS(status)) {
@@ -964,12 +1297,33 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
         }
         goto failure;
     }
+    if (context->use64BitWire) {
+        if (clientView64.ViewSize > (uint64_t)(SIZE_T)-1 ||
+            clientView64.ViewBase > (uint64_t)(ULONG_PTR)-1) {
+            status = STATUS_INTEGER_OVERFLOW;
+            goto failure;
+        }
+        context->client_view.Length = (ULONG)sizeof(context->client_view);
+        context->client_view.SectionHandle = context->hSectionHandle;
+        context->client_view.SectionOffset = clientView64.SectionOffset;
+        context->client_view.ViewSize = (SIZE_T)clientView64.ViewSize;
+        context->client_view.ViewBase =
+            (PVOID)(ULONG_PTR)clientView64.ViewBase;
+        /* ViewRemoteBase belongs to the peer address space and may legally
+         * exceed a WOW64 pointer.  This transport never dereferences it. */
+        context->client_view.ViewRemoteBase =
+            clientView64.ViewRemoteBase <= (uint64_t)(ULONG_PTR)-1
+                ? (PVOID)(ULONG_PTR)clientView64.ViewRemoteBase
+                : NULL;
+    }
     if (controlIdLength != (ULONG)sizeof(controlId) ||
-        (maxMessageLength != 0 &&
-         maxMessageLength < (ULONG)LPC_HEADER_DATA_OFFSET)) {
+        maxMessageLength <
+            (ULONG)(lpc_wire_data_offset(context->use64BitWire) +
+                    sizeof(ULONG))) {
         status = STATUS_DATA_ERROR;
         goto failure;
     }
+    context->negotiatedMaxMessageLength = maxMessageLength;
     lpc_state_store(&context->initialized, 1);
     if (config->lpRespID) {
         *config->lpRespID = controlId;
@@ -1070,19 +1424,16 @@ void LpcPort_ServerClose(PLPC_SERVER_CONTEXT context) {
 
         /* LPC exposes no disconnect primitive, so closing the communication
          * handle is the only way to wake a worker blocked in the Native
-         * receive.  The server lifetime was drained above, so no worker can
-         * still be using this record; keep the per-client lock ordering the
-         * same as the explicit-disconnect path for consistency. */
+         * receive.  Do not hold receiveLock while waiting for rundown: an
+         * admitted worker always owns its lifetime pin before taking it. */
         lpc_lifetime_mark_closing(&client->lifetime);
         if (client->hLPCPortClientHandle && context->api.pfnNtClose) {
             (void)context->api.pfnNtClose(client->hLPCPortClientHandle);
         }
-        lpc_lock_acquire(&client->receiveLock);
         lpc_lifetime_wait(&client->lifetime);
         if (closeEvents.onClose) {
             closeEvents.onClose(client->hLPCPortClientHandle);
         }
-        lpc_lock_release(&client->receiveLock);
         lpc_close_client_info(client);
     }
     lpc_lock_acquire(&context->lockWord);
@@ -1115,13 +1466,13 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
     LPC_MESSAGE_BUFFER replyStorage = LPC_PORT_ZERO_INIT;
     UCHAR *requestBuffer = NULL;
     UCHAR *replyBuffer = NULL;
-    LPC_HEADER sharedHeader = LPC_PORT_ZERO_INIT;
-    PLPC_HEADER request = NULL;
-    PLPC_HEADER reply = NULL;
     PLPC_MESSAGE inlineMessage = NULL;
     PLPC_SHARED_MEMORY sharedMemory = NULL;
     SIZE_T viewSize = 0;
     size_t totalLength = 0;
+    size_t dataOffset = 0;
+    size_t inlineCapacity = 0;
+    ULONG replyOptions = 0U;
     uint8_t actualAsync = 0;
     uint8_t actualShared = 0;
     void *sharedReplyCopy = NULL;
@@ -1146,9 +1497,11 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         goto done;
     }
     viewSize = context->client_view.ViewSize;
+    dataOffset = lpc_wire_data_offset(context->use64BitWire);
+    inlineCapacity = lpc_client_inline_capacity(context);
     actualAsync = useAsyncMode ? 1U : 0U;
     actualShared = useSharedMemory ? 1U : 0U;
-    if (messageLength > LPC_MESSAGE_MAX_PACK_SIZE) {
+    if ((size_t)messageLength > inlineCapacity) {
         /* A datagram cannot safely reference section-backed data. */
         if (actualAsync) {
             status = STATUS_NOT_SUPPORTED;
@@ -1171,27 +1524,29 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         if (messageLength) {
             libc_memcpy(sharedMemory->msg, message, messageLength);
         }
-        libc_memset(&sharedHeader, 0, sizeof(sharedHeader));
-        sharedHeader.ControlId = controlId;
-        sharedHeader.u1.s1.ulUseSharedMemory = 1;
-        sharedHeader.u1.s1.ulUseAsyncMethod = 0;
-        lpc_init_port_message(&sharedHeader.header, LPC_HEADER_DATA_OFFSET,
-                              (USHORT)LPC_TYPE_REQUEST);
+        lpc_wire_set_control_id(requestBuffer, context->use64BitWire,
+                                controlId);
+        lpc_wire_set_options(requestBuffer, context->use64BitWire,
+                             LPC_WIRE_OPTION_SHARED_MEMORY);
+        lpc_init_port_message(requestBuffer, context->use64BitWire, dataOffset,
+                               (USHORT)LPC_TYPE_REQUEST);
         status = context->api.pfnNtRequestWaitReplyPort(context->hLPCPortHandle,
-                                                         &sharedHeader.header,
-                                                         &((PLPC_HEADER)replyBuffer)->header);
+            lpc_wire_native_message(requestBuffer),
+            lpc_wire_native_message(replyBuffer));
     } else {
-        totalLength = LPC_HEADER_DATA_OFFSET + sizeof(ULONG) + messageLength;
-        if (totalLength > LPC_PORT_NATIVE_MAX_MESSAGE_LENGTH ||
+        totalLength = dataOffset + sizeof(ULONG) + messageLength;
+        if (totalLength > (size_t)context->negotiatedMaxMessageLength ||
+            totalLength > LPC_PORT_NATIVE_MAX_MESSAGE_LENGTH ||
             totalLength > sizeof(requestStorage)) {
             status = STATUS_INFO_LENGTH_MISMATCH;
             goto done;
         }
-        request = (PLPC_HEADER)(void *)requestBuffer;
-        request->ControlId = controlId;
-        request->u1.s1.ulUseSharedMemory = 0;
-        request->u1.s1.ulUseAsyncMethod = actualAsync != 0U;
-        inlineMessage = (PLPC_MESSAGE)(void *)request->data;
+        lpc_wire_set_control_id(requestBuffer, context->use64BitWire,
+                                controlId);
+        lpc_wire_set_options(requestBuffer, context->use64BitWire,
+                             actualAsync ? LPC_WIRE_OPTION_ASYNC : 0U);
+        inlineMessage = (PLPC_MESSAGE)(void *)lpc_wire_data(
+            requestBuffer, context->use64BitWire);
         inlineMessage->size = messageLength;
         if (messageLength) {
             libc_memcpy(inlineMessage->msg, message, messageLength);
@@ -1200,15 +1555,17 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
          * user-mode input header must leave Type/ZeroInit clear; supplying
          * the receive-side value is rejected by current Windows releases.
          * NtRequestWaitReplyPort continues to use LPC_TYPE_REQUEST. */
-        lpc_init_port_message(&request->header, totalLength,
-                              (USHORT)(actualAsync ? 0U : LPC_TYPE_REQUEST));
+        lpc_init_port_message(requestBuffer, context->use64BitWire, totalLength,
+                               (USHORT)(actualAsync ? 0U : LPC_TYPE_REQUEST));
         if (actualAsync) {
-            status = context->api.pfnNtRequestPort(context->hLPCPortHandle, &request->header);
+            status = context->api.pfnNtRequestPort(
+                context->hLPCPortHandle,
+                lpc_wire_native_message(requestBuffer));
             goto done;
         }
         status = context->api.pfnNtRequestWaitReplyPort(context->hLPCPortHandle,
-                                                        &request->header,
-                                                        &((PLPC_HEADER)replyBuffer)->header);
+            lpc_wire_native_message(requestBuffer),
+            lpc_wire_native_message(replyBuffer));
     }
     /* A reply callback is optional, but wire validation is not.  Even callers
      * that only need the transport status must not accept a malformed reply;
@@ -1218,14 +1575,17 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         goto done;
     }
 
-    reply = (PLPC_HEADER)(void *)replyBuffer;
+    replyOptions = lpc_wire_options(replyBuffer, context->use64BitWire);
     if (actualShared) {
         uint32_t replyLength = 0;
         uint8_t *replyData = NULL;
-        if (!lpc_port_message_valid(&reply->header, sizeof(replyStorage), LPC_HEADER_DATA_OFFSET) ||
-            reply->header.u2.s2.Type != (USHORT)LPC_TYPE_REPLY ||
-            reply->u1.s1.ulUseSharedMemory != actualShared ||
-            reply->u1.s1.ulUseAsyncMethod || reply->u1.s1.ulReserved ||
+        if (!lpc_port_message_valid(replyBuffer, context->use64BitWire,
+                                    sizeof(replyStorage), dataOffset) ||
+            lpc_wire_message_type(replyBuffer, context->use64BitWire) !=
+                (USHORT)LPC_TYPE_REPLY ||
+            (replyOptions & LPC_WIRE_OPTION_SHARED_MEMORY) == 0U ||
+            (replyOptions & (LPC_WIRE_OPTION_ASYNC |
+                             LPC_WIRE_OPTION_RESERVED)) != 0U ||
             !lpc_shared_message((PLPC_SHARED_MEMORY)context->client_view.ViewBase, viewSize,
                                 &replyLength, &replyData)) {
             status = STATUS_DATA_ERROR;
@@ -1242,12 +1602,16 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         }
     } else {
         PLPC_MESSAGE replyMessage = NULL;
-        if (!lpc_port_message_valid(&reply->header, sizeof(replyStorage),
-                                    LPC_HEADER_DATA_OFFSET + sizeof(ULONG)) ||
-            reply->header.u2.s2.Type != (USHORT)LPC_TYPE_REPLY ||
-            reply->u1.s1.ulUseSharedMemory != actualShared ||
-            reply->u1.s1.ulUseAsyncMethod || reply->u1.s1.ulReserved ||
-            !lpc_inline_message(reply, sizeof(replyStorage), &replyMessage, NULL)) {
+        if (!lpc_port_message_valid(
+                replyBuffer, context->use64BitWire, sizeof(replyStorage),
+                dataOffset + sizeof(ULONG)) ||
+            lpc_wire_message_type(replyBuffer, context->use64BitWire) !=
+                (USHORT)LPC_TYPE_REPLY ||
+            (replyOptions & (LPC_WIRE_OPTION_SHARED_MEMORY |
+                             LPC_WIRE_OPTION_ASYNC |
+                             LPC_WIRE_OPTION_RESERVED)) != 0U ||
+            !lpc_inline_message(replyBuffer, context->use64BitWire,
+                                sizeof(replyStorage), &replyMessage, NULL)) {
             status = STATUS_DATA_ERROR;
             goto done;
         }
@@ -1292,7 +1656,7 @@ uint8_t LpcPort_Register_ServerEvtCallback(PLPC_SERVER_CONTEXT context,
 NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
                                        const LARGE_INTEGER *timeout) {
     LPC_MESSAGE_BUFFER receiveStorage = LPC_PORT_ZERO_INIT;
-    PLPC_HEADER received = NULL;
+    UCHAR *received = NULL;
     PVOID portContext = NULL;
     HANDLE clientHandle = NULL;
     LPC_SERVER_CLIENT_INFO *clientInfo = NULL;
@@ -1302,6 +1666,10 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
     PLARGE_INTEGER timeoutArgument = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     NTSTATUS result = STATUS_UNSUCCESSFUL;
+    size_t nativeHeaderSize = 0U;
+    size_t dataOffset = 0U;
+    size_t inlineCapacity = 0U;
+    ULONG options = 0U;
     uint8_t clientHeld = 0;
     uint8_t clientLockHeld = 0;
 
@@ -1322,29 +1690,34 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
         goto done;
     }
     libc_memset(&receiveStorage, 0, sizeof(receiveStorage));
-    received = (PLPC_HEADER)(void *)receiveStorage.bytes;
+    received = receiveStorage.bytes;
+    nativeHeaderSize = lpc_wire_port_message_size(context->use64BitWire);
+    dataOffset = lpc_wire_data_offset(context->use64BitWire);
+    inlineCapacity = lpc_wire_inline_capacity(context->use64BitWire);
     if (timeout) {
         timeoutValue = *timeout;
         timeoutArgument = &timeoutValue;
         status = context->api.pfnNtReplyWaitReceivePortEx(
             context->hLPCPortServerHandle, &portContext, NULL,
-            &received->header, timeoutArgument);
+            lpc_wire_native_message(received), timeoutArgument);
     } else {
         status = context->api.pfnNtReplyWaitReceivePort(
             context->hLPCPortServerHandle, &portContext, NULL,
-            &received->header);
+            lpc_wire_native_message(received));
     }
     if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
         result = status;
         goto done;
     }
-    if (!lpc_port_message_valid(&received->header, sizeof(receiveStorage),
-                                sizeof(LPC_PORT_MESSAGE))) {
-        if (received->header.u2.s2.Type == (USHORT)LPC_TYPE_CONNECTION_REQUEST) {
-            (void)lpc_reject_connection(context, &received->header);
+    options = lpc_wire_options(received, context->use64BitWire);
+    messageType = lpc_wire_message_type(received, context->use64BitWire);
+    if (!lpc_port_message_valid(received, context->use64BitWire,
+                                sizeof(receiveStorage), nativeHeaderSize)) {
+        if (messageType == (USHORT)LPC_TYPE_CONNECTION_REQUEST) {
+            (void)lpc_reject_connection(context, received);
         } else if (portContext &&
-                   received->header.u2.s2.Type == (USHORT)LPC_TYPE_REQUEST &&
-                   !received->u1.s1.ulUseAsyncMethod) {
+                   messageType == (USHORT)LPC_TYPE_REQUEST &&
+                   (options & LPC_WIRE_OPTION_ASYNC) == 0U) {
             /* The native header can still identify the communication port
              * even when the SDK envelope length/checksum is malformed.  Send
              * a minimal reply for synchronous traffic so a client waiting in
@@ -1354,14 +1727,14 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
                 clientHeld = 1;
                 lpc_lock_acquire(&clientInfo->receiveLock);
                 clientLockHeld = 1;
-                if (lpc_prepare_empty_reply(received,
+                if (lpc_prepare_empty_reply(received, context->use64BitWire,
                                              sizeof(receiveStorage))) {
-                    if (received->u1.s1.ulUseSharedMemory) {
+                    if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                         lpc_clear_shared_memory(clientInfo);
                     }
                     result = context->api.pfnNtReplyPort(
                         clientInfo->hLPCPortClientHandle,
-                        &received->header);
+                        lpc_wire_native_message(received));
                 } else {
                     result = STATUS_DATA_ERROR;
                 }
@@ -1373,55 +1746,74 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
         }
         goto done;
     }
-    messageType = received->header.u2.s2.Type;
     /* NtRequestPort fills LPC_TYPE_DATAGRAM in the native receive header on
      * Windows.  A lightweight transport double (and a few older LPC shims)
      * can preserve the caller's zero Type instead; the SDK envelope's async
      * bit still unambiguously identifies that message as a datagram. */
-    if (messageType == 0U && received->u1.s1.ulUseAsyncMethod) {
+    if (messageType == 0U && (options & LPC_WIRE_OPTION_ASYNC) != 0U) {
         messageType = (USHORT)LPC_TYPE_DATAGRAM;
     }
     if (messageType == LPC_TYPE_CONNECTION_REQUEST) {
         uint8_t deny = 1;
         uint32_t responseControlId = 0;
         LPC_REMOTE_PORT_VIEW remoteView = LPC_PORT_ZERO_INIT;
+        LPC_REMOTE_PORT_VIEW64 remoteView64 = LPC_PORT_ZERO_INIT;
+        PLPC_REMOTE_PORT_VIEW nativeRemoteView = NULL;
         PLPC_SERVER_CLIENT_INFO pending = NULL;
 
         /* The server receives only the caller's four-byte connection info. */
-        if (received->header.u1.s1.TotalLength !=
-            sizeof(LPC_PORT_MESSAGE) + sizeof(uint32_t)) {
-            (void)lpc_reject_connection(context, &received->header);
+        if (lpc_wire_total_length(received, context->use64BitWire) !=
+            nativeHeaderSize + sizeof(uint32_t)) {
+            (void)lpc_reject_connection(context, received);
             result = STATUS_DATA_ERROR;
             goto done;
         }
-        responseControlId = (uint32_t)received->ControlId;
+        responseControlId = (uint32_t)lpc_wire_control_id(
+            received, context->use64BitWire);
         lpc_snapshot_events(context, &events);
         if (events.onPreConnect) {
             events.onPreConnect(&responseControlId, &deny);
         }
-        received->ControlId = (ULONG)responseControlId;
+        lpc_wire_set_control_id(received, context->use64BitWire,
+                                (ULONG)responseControlId);
         /* PortContext is returned on every later receive.  Allocate the
-         * record before accepting so the kernel can retain this pointer. */
+         * record and its never-reused opaque token before accepting so the
+         * kernel never retains a freeable record address. */
         if (!deny) {
             pending = (PLPC_SERVER_CLIENT_INFO)lpc_alloc_memory(sizeof(*pending));
             if (!pending) {
-                (void)lpc_reject_connection(context, &received->header);
+                (void)lpc_reject_connection(context, received);
                 result = STATUS_INSUFFICIENT_RESOURCES;
                 goto done;
             }
             libc_memset(pending, 0, sizeof(*pending));
             if (!lpc_lifetime_init(&pending->lifetime)) {
                 lpc_free_memory(pending);
-                (void)lpc_reject_connection(context, &received->header);
+                (void)lpc_reject_connection(context, received);
                 result = STATUS_INSUFFICIENT_RESOURCES;
+                goto done;
+            }
+            status = lpc_next_endpoint_token(&pending->portContextToken);
+            if (!NT_SUCCESS(status)) {
+                lpc_close_client_info(pending);
+                (void)lpc_reject_connection(context, received);
+                result = status;
                 goto done;
             }
         }
         libc_memset(&remoteView, 0, sizeof(remoteView));
-        remoteView.Length = (ULONG)sizeof(remoteView);
+        libc_memset(&remoteView64, 0, sizeof(remoteView64));
+        if (context->use64BitWire) {
+            remoteView64.Length = (ULONG)sizeof(remoteView64);
+            nativeRemoteView = (PLPC_REMOTE_PORT_VIEW)(void *)&remoteView64;
+        } else {
+            remoteView.Length = (ULONG)sizeof(remoteView);
+            nativeRemoteView = &remoteView;
+        }
         status = context->api.pfnNtAcceptConnectPort(
-            &clientHandle, (PVOID)pending, &received->header, (BOOLEAN)!deny,
-            NULL, deny ? NULL : &remoteView);
+            &clientHandle, pending ? pending->portContextToken : NULL,
+            lpc_wire_native_message(received), (BOOLEAN)!deny,
+            NULL, deny ? NULL : nativeRemoteView);
         if (!NT_SUCCESS(status)) {
             if (pending) {
                 lpc_close_client_info(pending);
@@ -1446,6 +1838,22 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             result = STATUS_DATA_ERROR;
             goto done;
         }
+        if (context->use64BitWire) {
+            if (remoteView64.ViewSize > (uint64_t)(SIZE_T)-1 ||
+                remoteView64.ViewBase > (uint64_t)(ULONG_PTR)-1) {
+                if (context->api.pfnNtClose) {
+                    (void)context->api.pfnNtClose(clientHandle);
+                }
+                if (pending) {
+                    lpc_close_client_info(pending);
+                }
+                result = STATUS_INTEGER_OVERFLOW;
+                goto done;
+            }
+            remoteView.Length = (ULONG)sizeof(remoteView);
+            remoteView.ViewSize = (SIZE_T)remoteView64.ViewSize;
+            remoteView.ViewBase = (PVOID)(ULONG_PTR)remoteView64.ViewBase;
+        }
         status = context->api.pfnNtCompleteConnectPort(clientHandle);
         if (!NT_SUCCESS(status)) {
             context->api.pfnNtClose(clientHandle);
@@ -1455,9 +1863,10 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             result = status;
             goto done;
         }
-        /* The accepted connection must have a stable PortContext record.  Keep
-         * this guard even though the allocation path above normally proves it
-         * non-NULL; it protects future changes and malformed test doubles. */
+        /* The accepted connection must have a record that owns the token.
+         * Keep this guard even though the allocation path above normally
+         * proves it non-NULL; it protects future changes and malformed test
+         * doubles. */
         if (!pending) {
             if (context->api.pfnNtClose) {
                 context->api.pfnNtClose(clientHandle);
@@ -1477,7 +1886,7 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             goto done;
         }
         if (events.onPostConnect) {
-            events.onPostConnect(clientHandle, received->ControlId);
+            events.onPostConnect(clientHandle, responseControlId);
         }
         result = STATUS_SUCCESS;
         goto done;
@@ -1505,16 +1914,18 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
     /* Shared-memory requests carry no inline LPC_MESSAGE size field; their
      * valid envelope ends at LPC_HEADER_DATA_OFFSET.  Only inline requests
      * require the additional ULONG before they can be parsed. */
-    if (received->header.u1.s1.TotalLength < LPC_HEADER_DATA_OFFSET ||
-        (!received->u1.s1.ulUseSharedMemory &&
-         received->header.u1.s1.TotalLength <
-             LPC_HEADER_DATA_OFFSET + sizeof(ULONG))) {
-        if (lpc_prepare_empty_reply(received, sizeof(receiveStorage))) {
-            if (received->u1.s1.ulUseSharedMemory) {
+    if (lpc_wire_total_length(received, context->use64BitWire) < dataOffset ||
+        ((options & LPC_WIRE_OPTION_SHARED_MEMORY) == 0U &&
+         lpc_wire_total_length(received, context->use64BitWire) <
+             dataOffset + sizeof(ULONG))) {
+        if (lpc_prepare_empty_reply(received, context->use64BitWire,
+                                    sizeof(receiveStorage))) {
+            if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                 lpc_clear_shared_memory(clientInfo);
             }
             result = context->api.pfnNtReplyPort(
-                clientInfo->hLPCPortClientHandle, &received->header);
+                clientInfo->hLPCPortClientHandle,
+                lpc_wire_native_message(received));
         } else {
             result = STATUS_DATA_ERROR;
         }
@@ -1529,19 +1940,22 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             uint8_t *sharedData = NULL;
             uint32_t sharedLength = 0;
 
-            if (received->u1.s1.ulUseAsyncMethod || received->u1.s1.ulReserved) {
-                if (lpc_prepare_empty_reply(received, sizeof(receiveStorage))) {
-                    if (received->u1.s1.ulUseSharedMemory) {
+            if ((options & (LPC_WIRE_OPTION_ASYNC |
+                            LPC_WIRE_OPTION_RESERVED)) != 0U) {
+                if (lpc_prepare_empty_reply(received, context->use64BitWire,
+                                            sizeof(receiveStorage))) {
+                    if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                         lpc_clear_shared_memory(clientInfo);
                     }
                     result = context->api.pfnNtReplyPort(
-                        clientInfo->hLPCPortClientHandle, &received->header);
+                        clientInfo->hLPCPortClientHandle,
+                        lpc_wire_native_message(received));
                 } else {
                     result = STATUS_DATA_ERROR;
                 }
                 break;
             }
-            if (received->u1.s1.ulUseSharedMemory) {
+            if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                 if (lpc_shared_message((PLPC_SHARED_MEMORY)clientInfo->client_view.ViewBase,
                                        clientInfo->client_view.ViewSize,
                                        &sharedLength, &sharedData) &&
@@ -1559,64 +1973,77 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
                 }
             } else {
                 PLPC_MESSAGE inlineMessage = NULL;
-                if (lpc_inline_message(received, sizeof(receiveStorage),
+                if (lpc_inline_message(received, context->use64BitWire,
+                                       sizeof(receiveStorage),
                                        &inlineMessage, NULL) &&
                     inlineMessage->size + sizeof(ULONG) ==
-                        received->header.u1.s1.TotalLength - LPC_HEADER_DATA_OFFSET) {
+                        lpc_wire_total_length(
+                            received, context->use64BitWire) - dataOffset) {
                     callbackLength = inlineMessage->size;
                     callbackData = inlineMessage->msg;
                     validPayload = 1;
                 }
             }
             if (validPayload && events.onSyncRequest) {
-                events.onSyncRequest(clientHandle, received->ControlId,
+                events.onSyncRequest(clientHandle,
+                                     lpc_wire_control_id(
+                                         received, context->use64BitWire),
                                      callbackData, callbackLength,
-                                     received->u1.s1.ulUseSharedMemory
+                                     (options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U
                                          ? (uint64_t)clientInfo->client_view.ViewSize
-                                         : (uint64_t)LPC_MESSAGE_MAX_PACK_SIZE);
-                if (received->u1.s1.ulUseSharedMemory && callbackLength) {
+                                         : (uint64_t)inlineCapacity);
+                if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U &&
+                    callbackLength) {
                     libc_memcpy(sharedData, callbackData, callbackLength);
                 }
             }
-            if (received->u1.s1.ulUseSharedMemory && callbackData &&
+            if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U && callbackData &&
                 callbackData != sharedData) {
                 lpc_free_memory(callbackData);
             }
             if (!validPayload) {
-                if (lpc_prepare_empty_reply(received, sizeof(receiveStorage))) {
-                    if (received->u1.s1.ulUseSharedMemory) {
+                if (lpc_prepare_empty_reply(received, context->use64BitWire,
+                                            sizeof(receiveStorage))) {
+                    if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                         lpc_clear_shared_memory(clientInfo);
                     }
                     result = context->api.pfnNtReplyPort(
-                        clientInfo->hLPCPortClientHandle, &received->header);
+                        clientInfo->hLPCPortClientHandle,
+                        lpc_wire_native_message(received));
                 } else {
                     result = STATUS_DATA_ERROR;
                 }
                 break;
             }
-            received->header.u2.s2.Type = (USHORT)LPC_TYPE_REPLY;
+            lpc_wire_set_type(received, context->use64BitWire,
+                              (USHORT)LPC_TYPE_REPLY);
             /* Replies must use the accepted communication-port handle, not
              * the connection-port handle on which the receive was issued. */
             result = context->api.pfnNtReplyPort(
-                clientInfo->hLPCPortClientHandle, &received->header);
+                clientInfo->hLPCPortClientHandle,
+                lpc_wire_native_message(received));
             break;
         }
 
         case LPC_TYPE_DATAGRAM: {
             PLPC_MESSAGE inlineMessage = NULL;
-            if (received->u1.s1.ulUseSharedMemory ||
-                received->u1.s1.ulReserved ||
-                !lpc_inline_message(received, sizeof(receiveStorage),
+            if ((options & (LPC_WIRE_OPTION_SHARED_MEMORY |
+                            LPC_WIRE_OPTION_RESERVED)) != 0U ||
+                !lpc_inline_message(received, context->use64BitWire,
+                                    sizeof(receiveStorage),
                                     &inlineMessage, NULL) ||
                 inlineMessage->size + sizeof(ULONG) !=
-                    received->header.u1.s1.TotalLength - LPC_HEADER_DATA_OFFSET) {
+                    lpc_wire_total_length(
+                        received, context->use64BitWire) - dataOffset) {
                 result = STATUS_DATA_ERROR;
                 break;
             }
             if (events.onAsyncRequest) {
-                events.onAsyncRequest(clientHandle, received->ControlId,
+                events.onAsyncRequest(clientHandle,
+                                      lpc_wire_control_id(
+                                          received, context->use64BitWire),
                                       inlineMessage->msg, inlineMessage->size,
-                                      (uint64_t)LPC_MESSAGE_MAX_PACK_SIZE);
+                                      (uint64_t)inlineCapacity);
             }
             result = STATUS_SUCCESS;
             break;
@@ -1638,13 +2065,15 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             /* A synchronous peer can otherwise remain blocked forever when a
              * new/unknown type reaches an older server.  Datagram-style
              * messages have no reply channel and are simply rejected. */
-            if (!received->u1.s1.ulUseAsyncMethod &&
-                lpc_prepare_empty_reply(received, sizeof(receiveStorage))) {
-                if (received->u1.s1.ulUseSharedMemory) {
+            if ((options & LPC_WIRE_OPTION_ASYNC) == 0U &&
+                lpc_prepare_empty_reply(received, context->use64BitWire,
+                                        sizeof(receiveStorage))) {
+                if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U) {
                     lpc_clear_shared_memory(clientInfo);
                 }
                 result = context->api.pfnNtReplyPort(
-                    clientInfo->hLPCPortClientHandle, &received->header);
+                    clientInfo->hLPCPortClientHandle,
+                    lpc_wire_native_message(received));
             } else {
                 result = STATUS_DATA_ERROR;
             }

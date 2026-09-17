@@ -4,8 +4,8 @@
  * This single process contains a named connection-port server and one client.
  * ALPC still creates a separate communication port for the accepted client.
  * Windows queues application traffic on the connection-port receive path, so
- * this single-client demo dispatches that path with ProcessClientEventEx while
- * using the accepted communication handle for replies and close notification.
+ * this demo keeps one ProcessBlockedEventEx dispatcher running and uses native
+ * PortContext to select the accepted handle for replies and close notification.
  *
  * Build with a Windows SDK and the ALPC implementation, for example:
  *   cl /W4 /WX alpc_demo.c alpc_port.c allocator.c libc.c list.c /Fe:alpc_demo.exe
@@ -162,9 +162,7 @@ static void alpc_demo_on_pre_connect(uint32_t *response_control_id,
                                      PVOID callback_context)
 {
     (void)callback_context;
-    if (response_control_id) {
-        *response_control_id += 1U;
-    }
+    (void)response_control_id;
     if (deny) {
         *deny = 0U;
     }
@@ -272,49 +270,9 @@ static DWORD WINAPI alpc_demo_connection_thread(LPVOID parameter)
             alpc_demo_print_status("AlpcPort_ProcessBlockedEventEx", status);
             Sleep(1);
         }
-        /* This demo owns one client.  Once its communication port is
-         * published, the connection worker can stop and the dedicated client
-         * worker consumes the connection-port receive queue.  A production
-         * multi-client dispatcher should route messages using native ALPC
-         * message attributes before invoking the per-client callbacks. */
-        if (g_alpc_demo_client_port) {
-            break;
-        }
     }
     if (g_alpc_demo_connection_done_event) {
         (void)SetEvent(g_alpc_demo_connection_done_event);
-    }
-    return 0;
-}
-
-static DWORD WINAPI alpc_demo_client_thread(LPVOID parameter)
-{
-    PALPC_PORT_SERVER_CONTEXT server = (PALPC_PORT_SERVER_CONTEXT)parameter;
-    HANDLE client_port = NULL;
-    LARGE_INTEGER timeout = ALPC_DEMO_ZERO_INIT;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    if (server) {
-        client_port = server->connectionPortHandle;
-    }
-    while (server && client_port &&
-           InterlockedCompareExchange(&g_alpc_demo_stop, 0, 0) == 0) {
-        timeout.QuadPart = -10000000LL;
-        status = AlpcPort_ProcessClientEventEx(server, client_port, &timeout);
-        if (status == STATUS_TIMEOUT) {
-            continue;
-        }
-        if (status == STATUS_PORT_DISCONNECTED ||
-            status == (NTSTATUS)STATUS_INVALID_PARAMETER) {
-            break;
-        }
-        if (!NT_SUCCESS(status)) {
-            alpc_demo_print_status("AlpcPort_ProcessClientEventEx", status);
-            Sleep(1);
-        }
-    }
-    if (g_alpc_demo_client_done_event) {
-        (void)SetEvent(g_alpc_demo_client_done_event);
     }
     return 0;
 }
@@ -426,13 +384,6 @@ int main(void)
     printf("[ALPC client] connected, response controlId=%lu\n",
            (unsigned long)client_context.negotiatedControlId);
 
-    client_thread = CreateThread(NULL, 0, alpc_demo_client_thread,
-                                 &server_context, 0, NULL);
-    if (!client_thread) {
-        printf("CreateThread(client) failed: error=%lu\n",
-               (unsigned long)GetLastError());
-        goto cleanup;
-    }
     send_timeout.QuadPart = -50000000LL;
     status = AlpcPort_SendMessage(&client_context, sync_message,
                                   (ULONG)(sizeof(sync_message) - 1U),
@@ -463,7 +414,6 @@ int main(void)
         printf("server close callback was not observed before timeout\n");
     }
     (void)InterlockedExchange(&g_alpc_demo_stop, 1);
-    (void)WaitForSingleObject(g_alpc_demo_client_done_event, 5000);
     (void)WaitForSingleObject(g_alpc_demo_connection_done_event, 5000);
     result = 0;
 

@@ -3,10 +3,12 @@
  *
  * The SDK intentionally uses resolved Native API function pointers instead of
  * importing ntdll/ntoskrnl symbols.  This keeps one source compatible with
- * user-mode, kernel-mode and C++ callers.  ALPC has a connection port and a
- * separate communication port for every accepted client; the server API
- * exposes both phases explicitly so applications can assign one worker to
- * each communication port without hidden threads.
+ * user-mode, kernel-mode and C++ callers.  ALPC creates a communication handle
+ * for every accepted client, but Windows delivers its application traffic on
+ * the shared connection-port receive queue.  The dispatcher uses native
+ * PortContext to select the communication handle used for replies.  The
+ * accepted-port receive API remains available for legacy providers that
+ * explicitly deliver traffic on those handles.
  */
 #ifndef ALPC_PORT_H_INCLUDED
 #define ALPC_PORT_H_INCLUDED
@@ -144,6 +146,9 @@ typedef LONG NTSTATUS;
 #ifndef STATUS_INSUFFICIENT_RESOURCES
 #  define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)(LONG)0xC000009AUL)
 #endif
+#ifndef STATUS_INTEGER_OVERFLOW
+#  define STATUS_INTEGER_OVERFLOW ((NTSTATUS)(LONG)0xC0000095UL)
+#endif
 #ifndef STATUS_NOT_SUPPORTED
 #  define STATUS_NOT_SUPPORTED ((NTSTATUS)(LONG)0xC00000BBUL)
 #endif
@@ -242,6 +247,11 @@ typedef struct _ALPC_PORT_LIFETIME {
 /* Native NtAlpcSendWaitReceivePort flag: wait for the reply to this send. */
 #define ALPC_PORT_NATIVE_FLAG_SYNC_REQUEST        0x00020000UL
 
+/* Receive-side attribute requested from NtAlpcSendWaitReceivePort.  These
+ * names are SDK-prefixed because the public Windows headers do not expose the
+ * native ALPC attribute ABI consistently across SDK/WDK releases. */
+#define ALPC_PORT_MESSAGE_CONTEXT_ATTRIBUTE       0x20000000UL
+
 /* Common values accepted in the portFlags fields.  Keep flags at zero unless
  * the deployment explicitly needs impersonation or duplicate-object support. */
 #define ALPC_PORT_FLAG_NONE                       0x00000000UL
@@ -309,6 +319,24 @@ typedef struct _ALPC_PORT_SDK_ATTRIBUTES {
     ULONG Reserved;
 #endif
 } ALPC_PORT_SDK_ATTRIBUTES, *PALPC_PORT_SDK_ATTRIBUTES;
+
+typedef struct _ALPC_PORT_MESSAGE_ATTRIBUTES {
+    ULONG AllocatedAttributes;
+    ULONG ValidAttributes;
+} ALPC_PORT_MESSAGE_ATTRIBUTES, *PALPC_PORT_MESSAGE_ATTRIBUTES;
+
+typedef struct _ALPC_PORT_CONTEXT_ATTRIBUTE {
+    PVOID PortContext;
+    PVOID MessageContext;
+    ULONG Sequence;
+    ULONG MessageId;
+    ULONG CallbackId;
+} ALPC_PORT_CONTEXT_ATTRIBUTE, *PALPC_PORT_CONTEXT_ATTRIBUTE;
+
+typedef struct _ALPC_PORT_CONTEXT_ATTRIBUTES {
+    ALPC_PORT_MESSAGE_ATTRIBUTES Header;
+    ALPC_PORT_CONTEXT_ATTRIBUTE Context;
+} ALPC_PORT_CONTEXT_ATTRIBUTES, *PALPC_PORT_CONTEXT_ATTRIBUTES;
 #pragma pack(pop)
 
 #define ALPC_PORT_FRAME_DATA_OFFSET ((size_t)offsetof(ALPC_PORT_FRAME, data))
@@ -323,11 +351,9 @@ typedef NTSTATUS (NTAPI *AlpcPort_SyncReplyCallback)(const uint8_t *buffer,
                                                       ULONG length,
                                                       PVOID callbackContext);
 
-/* Handles an unsolicited request or datagram observed while a client is
- * waiting for its own reply.  For a request, the callback may edit frame->data
- * and frame->PayloadLength; the transport sends the resulting frame as a
- * reply.  It must not call AlpcPort_SendMessage recursively on the same
- * context. */
+/* Legacy callback signature retained for source and ABI compatibility.  The
+ * client transport no longer invokes it; peer requests must be consumed by a
+ * dedicated receive loop. */
 typedef NTSTATUS (NTAPI *AlpcPort_IncomingRequestCallback)(
     PALPC_PORT_FRAME frame, SIZE_T capacity, PVOID callbackContext);
 
@@ -339,8 +365,8 @@ typedef void (*AlpcPort_PreConnectCallback)(uint32_t *responseControlId,
 /** Runs after a communication port has been accepted and completed.  The
  * SDK owns clientPort and closes it after an explicit disconnect or shutdown;
  * workers should only use the handle with ProcessClientEvent*.  Do not call
- * AlpcPort_ServerClose from any callback while an event-processing call is in
- * flight. */
+ * AlpcPort_ServerDisconnectClient for this endpoint, or AlpcPort_ServerClose,
+ * from this callback while the event-processing call is in flight. */
 typedef void (*AlpcPort_PostConnectCallback)(HANDLE clientPort,
                                               const ALPC_PORT_CLIENT_ID *clientId,
                                               uint32_t controlId,
@@ -434,8 +460,10 @@ typedef NTSTATUS (NTAPI *AlpcPort_NtAlpcSendWaitReceivePort)(HANDLE portHandle,
                                                               PVOID receiveMessageAttributes,
                                                               PLARGE_INTEGER timeout);
 typedef NTSTATUS (NTAPI *AlpcPort_NtAlpcDisconnectPort)(HANDLE portHandle, ULONG flags);
+typedef NTSTATUS (NTAPI *AlpcPort_NtQuerySystemTime)(PLARGE_INTEGER systemTime);
 
-/** Client-side resolver table.  Every field is mandatory. */
+/** Client-side resolver table.  Native transport entries are mandatory;
+ * pfnNtQuerySystemTime is optional when a platform clock is available. */
 typedef struct _ALPC_PORT_CLIENT_APIS {
     AlpcPort_RtlInitAnsiString pfnRtlInitAnsiString;
     AlpcPort_RtlAnsiStringToUnicodeString pfnRtlAnsiStringToUnicodeString;
@@ -444,6 +472,8 @@ typedef struct _ALPC_PORT_CLIENT_APIS {
     AlpcPort_NtAlpcConnectPort pfnNtAlpcConnectPort;
     AlpcPort_NtAlpcSendWaitReceivePort pfnNtAlpcSendWaitReceivePort;
     AlpcPort_NtAlpcDisconnectPort pfnNtAlpcDisconnectPort;
+    /* Optional.  The transport uses a platform clock when this is NULL. */
+    AlpcPort_NtQuerySystemTime pfnNtQuerySystemTime;
 } ALPC_PORT_CLIENT_APIS, *PALPC_PORT_CLIENT_APIS;
 
 /** Server-side resolver table.  The legacy completion slot is retained for
@@ -461,6 +491,8 @@ typedef struct _ALPC_PORT_SERVER_APIS {
     AlpcPort_NtAlpcCompleteConnectPort pfnNtAlpcCompleteConnectPort;
     AlpcPort_NtAlpcSendWaitReceivePort pfnNtAlpcSendWaitReceivePort;
     AlpcPort_NtAlpcDisconnectPort pfnNtAlpcDisconnectPort;
+    /* Optional.  The transport uses a platform clock when this is NULL. */
+    AlpcPort_NtQuerySystemTime pfnNtQuerySystemTime;
 } ALPC_PORT_SERVER_APIS, *PALPC_PORT_SERVER_APIS;
 
 /** Client creation settings; zero-initialize before use. */
@@ -472,7 +504,8 @@ typedef struct _ALPC_PORT_CLIENT_CONFIG {
     SECURITY_QUALITY_OF_SERVICE securityQos;
     ALPC_PORT_CLIENT_APIS api;
     const LARGE_INTEGER *connectTimeout;
-    /* Optional handler for peer messages observed during a synchronous send. */
+    /* Deprecated ABI compatibility slot; copied into the context but no
+     * longer invoked.  Use a dedicated receive loop for peer requests. */
     AlpcPort_IncomingRequestCallback onIncomingRequest;
     PVOID incomingRequestContext;
 } ALPC_PORT_CLIENT_CONFIG, *PALPC_PORT_CLIENT_CONFIG;
@@ -483,14 +516,17 @@ typedef struct _ALPC_PORT_CLIENT_CONTEXT {
     UNICODE_STRING unicodeName;
     SIZE_T maxMessageLength;
     uint32_t negotiatedControlId;
+    /* Serializes outbound calls; a blocking receive must not hold this lock. */
     ALPC_PORT_LOCK sendLock;
     ALPC_PORT_LIFETIME lifetime;
     /* Published with an interlocked store; zero means disconnected. */
     volatile LONG initialized;
     ALPC_PORT_CLIENT_APIS api;
-    /* Copied from config; invoked only while SendMessage owns receiveLock. */
+    /* Deprecated ABI compatibility slots; retained but not invoked. */
     AlpcPort_IncomingRequestCallback onIncomingRequest;
     PVOID incomingRequestContext;
+    /* Serializes application-owned receive calls independently of sends. */
+    ALPC_PORT_LOCK receiveLock;
 } ALPC_PORT_CLIENT_CONTEXT, *PALPC_PORT_CLIENT_CONTEXT;
 
 /** Server creation settings; zero-initialize before use. */
@@ -514,37 +550,60 @@ typedef struct _ALPC_PORT_SERVER_CLIENT {
     /* Must remain first: list.h operates on object pointers directly. */
     LIST_ELEM listEntry;
     HANDLE portHandle;
+    /* A HANDLE may be recycled after close.  This process-wide monotonic
+     * identity distinguishes delayed operations targeting an older endpoint. */
+    uint64_t endpointCookie;
+    /* Pointer-sized opaque value supplied to Native ALPC as PortContext.
+     * It is process/module-wide, never dereferenced, and never reused. */
+    PVOID portContextToken;
     ALPC_PORT_CLIENT_ID clientId;
     uint32_t controlId;
     ALPC_PORT_LOCK receiveLock;
     ALPC_PORT_LIFETIME lifetime;
     ALPC_PORT_MESSAGE currentRequest;
+    ULONG currentControlId;
+    PVOID currentPendingReply;
     uint8_t currentRequestValid;
+    uint8_t currentRequestCaptured;
 } ALPC_PORT_SERVER_CLIENT, *PALPC_PORT_SERVER_CLIENT;
 
-/* Opaque-to-callers token identifying a request that was captured by a
- * server callback.  The token is valid until AlpcPort_ServerReply returns. */
+/* Opaque-to-callers token identifying a server-owned pending request.  Copies
+ * share the same registry entry; exactly one copy may claim it for reply. */
 typedef struct _ALPC_PORT_REPLY_TOKEN {
-    HANDLE clientPort;
-    ALPC_PORT_MESSAGE request;
-    uint8_t valid;
+    PVOID opaque;
+    uint64_t cookie;
 } ALPC_PORT_REPLY_TOKEN, *PALPC_PORT_REPLY_TOKEN;
+
+/* Opaque stable identity for one accepted endpoint.  Copies may be retained
+ * after disconnect, but callers must never dereference or modify the fields. */
+typedef struct _ALPC_PORT_ENDPOINT_TOKEN {
+    PVOID opaque;
+    uint64_t cookie;
+} ALPC_PORT_ENDPOINT_TOKEN, *PALPC_PORT_ENDPOINT_TOKEN;
 
 /** Server-owned state; one context may service many communication ports. */
 typedef struct _ALPC_PORT_SERVER_CONTEXT {
     HANDLE connectionPortHandle;
     UNICODE_STRING unicodeName;
     SIZE_T maxMessageLength;
+    /* Reused when accepting communication ports so their Native policy
+     * matches the connection port (notably synchronous request support). */
+    ALPC_PORT_SDK_ATTRIBUTES portAttributes;
     ALPC_PORT_SERVER_EVENTS events;
     LIST clientList;
+    LIST pendingReplies;
     uint32_t clientCount;
     uint32_t maxClients;
+    uint64_t pendingReplyCookieSequence;
     ALPC_PORT_LOCK lockWord;
     /* Serializes receives from the shared connection queue. */
     ALPC_PORT_LOCK connectionReceiveLock;
     ALPC_PORT_LIFETIME lifetime;
     /* Published with an interlocked store; zero means closed. */
     volatile LONG initialized;
+    /* 0 unknown, 1 observed on the shared receive path, -1 unavailable or
+     * inconsistent.  Used by upper layers for truthful capability exchange. */
+    volatile LONG nativePortContextState;
     ALPC_PORT_SERVER_APIS api;
 } ALPC_PORT_SERVER_CONTEXT, *PALPC_PORT_SERVER_CONTEXT;
 
@@ -564,10 +623,9 @@ extern "C" {
  * The onPostConnect callback receives each communication-port handle.  For a
  * multi-process broker, one dispatcher may continue calling
  * AlpcPort_ProcessBlockedEventEx: application frames arriving on the shared
- * connection queue are routed by native ClientId.  The shared-queue path
- * prefers an exact native process+thread ClientId match, allowing multiple
- * endpoints from one process when each endpoint has a distinct originating
- * thread; legacy providers that omit thread identity fall back to the
+ * connection queue are routed by the native PortContext assigned at accept.
+ * Providers that do not return the context attribute fall back to an exact
+ * process+thread ClientId match; ambiguous process-only identities require
  * dedicated accepted-port workers.  Alternatively, a legacy
  * deployment may hand each handle to a worker and call
  * AlpcPort_ProcessClientEventEx, but the two receive paths must not be mixed
@@ -597,7 +655,8 @@ uint8_t AlpcPort_Register_ServerEvtCallback(PALPC_PORT_SERVER_CONTEXT context,
 /**
  * Waits indefinitely for one connection or application frame on the server
  * connection port.  Connection frames are reported through onPostConnect;
- * application frames are routed by native ClientId and dispatched through
+ * application frames are routed by native PortContext (with a ClientId
+ * fallback only when the provider omits that attribute) and dispatched through
  * onSyncRequest/onAsyncRequest.  Use one dispatcher for this shared queue.
  */
 NTSTATUS AlpcPort_ProcessBlockedEvent(PALPC_PORT_SERVER_CONTEXT context);
@@ -611,10 +670,10 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
                                          const LARGE_INTEGER *timeout);
 
 /**
- * Waits indefinitely for one message on a specific accepted client port.
- * The SDK serializes workers per clientPort; separate client ports may be
- * processed concurrently.  The callback's NTSTATUS is sent in the reply and
- * is returned by the client-side SendMessage call.
+ * Legacy-provider receive path for one accepted client port.  Native Windows
+ * ALPC delivers application frames through ProcessBlockedEvent instead.  Do
+ * not run both receive paths for the same endpoint.  The callback's NTSTATUS
+ * is sent in the reply and is returned by the client-side SendMessage call.
  */
 NTSTATUS AlpcPort_ProcessClientEvent(PALPC_PORT_SERVER_CONTEXT context,
                                       HANDLE clientPort);
@@ -632,6 +691,22 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
 NTSTATUS AlpcPort_ServerDisconnectClient(PALPC_PORT_SERVER_CONTEXT context,
                                            HANDLE clientPort);
 
+/** Captures the stable identity of a currently accepted endpoint. */
+NTSTATUS AlpcPort_ServerGetClientToken(PALPC_PORT_SERVER_CONTEXT context,
+                                       HANDLE clientPort,
+                                       PALPC_PORT_ENDPOINT_TOKEN token);
+
+/** Disconnects exactly the endpoint named by token.  A stale token cannot
+ * select a newer endpoint whose native HANDLE or allocation was reused. */
+NTSTATUS AlpcPort_ServerDisconnectClientToken(
+    PALPC_PORT_SERVER_CONTEXT context,
+    const ALPC_PORT_ENDPOINT_TOKEN *token);
+
+/** Returns one only after the provider has supplied a valid native
+ * PortContext attribute for application traffic on the shared receive path. */
+uint8_t AlpcPort_ServerHasNativePortContext(
+    const ALPC_PORT_SERVER_CONTEXT *context);
+
 /* Captures the current request while inside onSyncRequest.  Return
  * STATUS_PENDING from that callback, enqueue the token, and later call
  * AlpcPort_ServerReply to complete the request outside the receive thread. */
@@ -645,6 +720,20 @@ NTSTATUS AlpcPort_ServerReply(PALPC_PORT_SERVER_CONTEXT context,
                               NTSTATUS requestStatus,
                               const LARGE_INTEGER *timeout);
 
+/* Converts a Native timeout to a stable absolute deadline.  NULL timeouts are
+ * represented by the caller retaining NULL and need not be normalized.  Zero
+ * returns STATUS_TIMEOUT because it is already expired.  Negative values are
+ * relative 100-ns intervals; positive values are absolute system time. */
+NTSTATUS AlpcPort_NormalizeTimeout(AlpcPort_NtQuerySystemTime querySystemTime,
+                                   const LARGE_INTEGER *timeout,
+                                   PLARGE_INTEGER deadline);
+
+/* Computes a fresh relative timeout from an absolute deadline.  Returns
+ * STATUS_TIMEOUT with remaining==0 after expiry, including a zero deadline. */
+NTSTATUS AlpcPort_RemainingTimeout(AlpcPort_NtQuerySystemTime querySystemTime,
+                                   const LARGE_INTEGER *deadline,
+                                   PLARGE_INTEGER remaining);
+
 /** Connects a client, optionally waiting only until connectTimeout expires. */
 NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
                           PALPC_PORT_CLIENT_CONTEXT context);
@@ -657,11 +746,15 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
  * STATUS_INFO_LENGTH_MISMATCH instead of allocating unbounded memory.  A
  * synchronous server callback status is returned to the caller (and the
  * reply callback still receives the payload), so transport success and
- * application failure remain distinguishable.  A
- * timed-out request may already have reached the server, so operations should
- * be idempotent when retrying.  If an incoming-request callback is configured,
- * requests observed while waiting for the reply are serviced inline; that
- * callback must not recursively send on this same client context.
+ * application failure remain distinguishable.  A timed-out request may
+ * already have reached the server, so operations should be idempotent when
+ * retrying.  Synchronous requests are serialized per client.  Datagram sends
+ * use independent frames and may proceed while a synchronous request is
+ * waiting, including from a receive callback.  A reply callback runs after
+ * the send lock and lifetime pin have been released, so it may disconnect the
+ * client; its reply pointer remains valid only until the callback returns.
+ * The legacy onIncomingRequest fields are retained for ABI compatibility and
+ * are not invoked.
  */
 NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                               const void *message,
@@ -677,7 +770,10 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
  * pins before closing the native handle. */
 uint8_t AlpcPort_ClientAcquire(PALPC_PORT_CLIENT_CONTEXT context);
 void AlpcPort_ClientRelease(PALPC_PORT_CLIENT_CONTEXT context);
-/* Serializes application-owned receives with synchronous SendMessage. */
+/* Serializes application-owned receives with each other.  It is independent
+ * from the outbound send lock so a dedicated blocking receiver does not stop
+ * another thread from sending on the same connected endpoint.  Callers must
+ * hold a ClientAcquire pin until after ClientReceiveUnlock. */
 void AlpcPort_ClientReceiveLock(PALPC_PORT_CLIENT_CONTEXT context);
 void AlpcPort_ClientReceiveUnlock(PALPC_PORT_CLIENT_CONTEXT context);
 

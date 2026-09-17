@@ -22,6 +22,7 @@
 #undef STATUS_INFO_LENGTH_MISMATCH
 #undef STATUS_DATA_ERROR
 #undef STATUS_INSUFFICIENT_RESOURCES
+#undef STATUS_INTEGER_OVERFLOW
 #undef STATUS_NOT_SUPPORTED
 #undef STATUS_DEVICE_BUSY
 #undef STATUS_TIMEOUT
@@ -32,6 +33,7 @@
 #define STATUS_INFO_LENGTH_MISMATCH static_cast<NTSTATUS>(static_cast<int32_t>(0xC0000004U))
 #define STATUS_DATA_ERROR static_cast<NTSTATUS>(static_cast<int32_t>(0xC000003EU))
 #define STATUS_INSUFFICIENT_RESOURCES static_cast<NTSTATUS>(static_cast<int32_t>(0xC000009AU))
+#define STATUS_INTEGER_OVERFLOW static_cast<NTSTATUS>(static_cast<int32_t>(0xC0000095U))
 #define STATUS_NOT_SUPPORTED static_cast<NTSTATUS>(static_cast<int32_t>(0xC00000BBU))
 #define STATUS_DEVICE_BUSY static_cast<NTSTATUS>(static_cast<int32_t>(0xC00000E8U))
 #define STATUS_TIMEOUT static_cast<NTSTATUS>(static_cast<int32_t>(0x00000102U))
@@ -43,13 +45,17 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace
 {
 
 static constexpr SIZE_T kAlpcCapacity = static_cast<SIZE_T>(0x1000U);
+static constexpr USHORT kAlpcConnectionCompleteType =
+    static_cast<USHORT>(0x000BU);
 
 struct FakeAlpcServer
 {
@@ -60,13 +66,17 @@ struct FakeAlpcServer
     }
 };
 
+struct FakeAlpcSync;
+
 struct FakeAlpcEndpoint
 {
     PVOID serverContext;
+    FakeAlpcSync *pendingSync;
     bool closed;
 
     FakeAlpcEndpoint()
-        : serverContext(static_cast<PVOID>(0)), closed(false)
+        : serverContext(static_cast<PVOID>(0)),
+          pendingSync(static_cast<FakeAlpcSync *>(0)), closed(false)
     {
     }
 };
@@ -127,13 +137,33 @@ struct FakeAlpcState
     FakeAlpcQueued current;
     bool hasCurrent;
     bool mutateNextRequest;
+    bool appendTrailingByteNextRequest;
+    PVOID portContextOverride;
+    NTSTATUS emptyEndpointPollStatus;
+    uint32_t replySendOnlyCalls;
+    uint32_t replyWithReceiveCalls;
+    uint32_t lastReplyControlId;
+    NTSTATUS nextReplyStatus;
+    uint32_t connectionCompleteDeliveries;
+    LONGLONG connectElapsedTicks;
+    LONGLONG lastConnectTimeout;
+    LONGLONG lastEndpointReceiveTimeout;
+    USHORT nativeTypeHighBits;
     std::vector<FakeAlpcServer *> servers;
     std::vector<FakeAlpcEndpoint *> endpoints;
 
     FakeAlpcState()
         : mutex(), condition(), queue(), server(static_cast<FakeAlpcServer *>(0)),
           serverContext(static_cast<ALPC_PORT_SERVER_CONTEXT *>(0)), current(),
-          hasCurrent(false), mutateNextRequest(false), servers(), endpoints()
+          hasCurrent(false), mutateNextRequest(false),
+          appendTrailingByteNextRequest(false),
+          portContextOverride(static_cast<PVOID>(0)),
+          emptyEndpointPollStatus(STATUS_TIMEOUT), replySendOnlyCalls(0U),
+          replyWithReceiveCalls(0U), lastReplyControlId(0U),
+          nextReplyStatus(STATUS_SUCCESS), connectionCompleteDeliveries(0U),
+          connectElapsedTicks(0), lastConnectTimeout(0),
+          lastEndpointReceiveTimeout(0), nativeTypeHighBits(0U), servers(),
+          endpoints()
     {
     }
 
@@ -146,6 +176,18 @@ struct FakeAlpcState
         current = FakeAlpcQueued();
         hasCurrent = false;
         mutateNextRequest = false;
+        appendTrailingByteNextRequest = false;
+        portContextOverride = static_cast<PVOID>(0);
+        emptyEndpointPollStatus = STATUS_TIMEOUT;
+        replySendOnlyCalls = 0U;
+        replyWithReceiveCalls = 0U;
+        lastReplyControlId = 0U;
+        nextReplyStatus = STATUS_SUCCESS;
+        connectionCompleteDeliveries = 0U;
+        connectElapsedTicks = 0;
+        lastConnectTimeout = 0;
+        lastEndpointReceiveTimeout = 0;
+        nativeTypeHighBits = 0U;
         for (FakeAlpcEndpoint *endpoint : endpoints) {
             delete endpoint;
         }
@@ -159,6 +201,16 @@ struct FakeAlpcState
 
 static FakeAlpcState g_alpc = {};
 static thread_local FakeAlpcQueued g_alpc_thread_current = {};
+static LONGLONG g_alpc_system_time = 0;
+
+static NTSTATUS NTAPI fake_alpc_query_system_time(PLARGE_INTEGER systemTime)
+{
+    if (systemTime == static_cast<PLARGE_INTEGER>(0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    systemTime->QuadPart = g_alpc_system_time;
+    return STATUS_SUCCESS;
+}
 
 static FakeAlpcQueued make_alpc_message(const PALPC_PORT_MESSAGE message,
                                         FakeAlpcEndpoint *endpoint,
@@ -180,6 +232,22 @@ static FakeAlpcQueued make_alpc_message(const PALPC_PORT_MESSAGE message,
         std::memcpy(queued.bytes.data(), message, static_cast<std::size_t>(length));
     }
     queued.length = length;
+    return queued;
+}
+
+static FakeAlpcQueued make_alpc_connection_complete(
+    FakeAlpcEndpoint *endpoint, USHORT messageType)
+{
+    FakeAlpcQueued queued = {};
+    PALPC_PORT_MESSAGE message = reinterpret_cast<PALPC_PORT_MESSAGE>(
+        queued.bytes.data());
+
+    queued.endpoint = endpoint;
+    queued.length = static_cast<SIZE_T>(sizeof(ALPC_PORT_MESSAGE));
+    message->u1.s1.TotalLength =
+        static_cast<USHORT>(sizeof(ALPC_PORT_MESSAGE));
+    message->u1.s1.DataLength = 0U;
+    message->u2.s2.Type = messageType;
     return queued;
 }
 
@@ -341,7 +409,8 @@ static NTSTATUS NTAPI fake_alpc_complete_connect(HANDLE)
 
 static NTSTATUS NTAPI fake_alpc_send_wait_receive(
     HANDLE portHandle, ULONG flags, PALPC_PORT_MESSAGE sendMessage, PVOID,
-    PALPC_PORT_MESSAGE receiveMessage, PSIZE_T bufferLength, PVOID,
+    PALPC_PORT_MESSAGE receiveMessage, PSIZE_T bufferLength,
+    PVOID receiveMessageAttributes,
     PLARGE_INTEGER timeout);
 
 static NTSTATUS fake_alpc_process_connection(void)
@@ -362,7 +431,7 @@ static NTSTATUS NTAPI fake_alpc_connect(PHANDLE portHandle,
                                         PSIZE_T bufferLength,
                                         PVOID,
                                         PVOID,
-                                        PLARGE_INTEGER)
+                                        PLARGE_INTEGER timeout)
 {
     FakeAlpcConnect connect = {};
     PALPC_PORT_FRAME frame = static_cast<PALPC_PORT_FRAME>(
@@ -374,9 +443,21 @@ static NTSTATUS NTAPI fake_alpc_connect(PHANDLE portHandle,
         g_alpc.server->closed || frame == static_cast<PALPC_PORT_FRAME>(0)) {
         return STATUS_PORT_DISCONNECTED;
     }
-    enqueue_alpc_message(make_alpc_message(&frame->header,
-                                           static_cast<FakeAlpcEndpoint *>(0),
-                                           &connect, static_cast<FakeAlpcSync *>(0)));
+    g_alpc.lastConnectTimeout = timeout != static_cast<PLARGE_INTEGER>(0)
+                                    ? timeout->QuadPart
+                                    : 0;
+    {
+        FakeAlpcQueued connectionRequest = make_alpc_message(
+            &frame->header, static_cast<FakeAlpcEndpoint *>(0), &connect,
+            static_cast<FakeAlpcSync *>(0));
+        PALPC_PORT_MESSAGE nativeRequest =
+            reinterpret_cast<PALPC_PORT_MESSAGE>(
+                connectionRequest.bytes.data());
+        nativeRequest->u2.s2.Type = static_cast<USHORT>(
+            (nativeRequest->u2.s2.Type & 0x0fffU) |
+            g_alpc.nativeTypeHighBits);
+        enqueue_alpc_message(connectionRequest);
+    }
     processStatus = fake_alpc_process_connection();
     if (!NT_SUCCESS(processStatus) || connect.denied || !connect.accepted ||
         connect.endpoint == static_cast<FakeAlpcEndpoint *>(0)) {
@@ -385,17 +466,27 @@ static NTSTATUS NTAPI fake_alpc_connect(PHANDLE portHandle,
                    : processStatus;
     }
     *portHandle = static_cast<HANDLE>(connect.endpoint);
-    frame->ControlId = connect.responseControlId;
+    g_alpc_system_time += g_alpc.connectElapsedTicks;
+    if (g_alpc.emptyEndpointPollStatus == STATUS_TIMEOUT) {
+        enqueue_alpc_message(make_alpc_connection_complete(
+            connect.endpoint,
+            static_cast<USHORT>(kAlpcConnectionCompleteType |
+                                g_alpc.nativeTypeHighBits)));
+    }
+    /* Real NtAlpcConnectPort leaves the caller's connection payload in place;
+       the ControlId chosen by the acceptor is not copied back to the client. */
     frame->Flags = 0;
     frame->PayloadLength = 0;
     frame->Status = STATUS_SUCCESS;
-    frame->header.u2.s2.Type = static_cast<USHORT>(ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST);
+    frame->header.u2.s2.Type = static_cast<USHORT>(
+        (ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST & 0x0fffU) |
+        g_alpc.nativeTypeHighBits);
     frame->header.u1.s1.TotalLength = static_cast<USHORT>(ALPC_PORT_FRAME_DATA_OFFSET);
     frame->header.u1.s1.DataLength = static_cast<USHORT>(
         ALPC_PORT_FRAME_DATA_OFFSET - sizeof(ALPC_PORT_MESSAGE));
-    if (bufferLength != static_cast<PSIZE_T>(0)) {
-        *bufferLength = static_cast<SIZE_T>(ALPC_PORT_FRAME_DATA_OFFSET);
-    }
+    /* Successful native calls may leave BufferLength at its input capacity.
+       TotalLength is the authoritative number of returned bytes. */
+    (void)bufferLength;
     return STATUS_SUCCESS;
 }
 
@@ -421,7 +512,8 @@ static NTSTATUS NTAPI fake_alpc_disconnect(HANDLE handle, ULONG)
 
 static NTSTATUS NTAPI fake_alpc_send_wait_receive(
     HANDLE portHandle, ULONG flags, PALPC_PORT_MESSAGE sendMessage, PVOID,
-    PALPC_PORT_MESSAGE receiveMessage, PSIZE_T bufferLength, PVOID,
+    PALPC_PORT_MESSAGE receiveMessage, PSIZE_T bufferLength,
+    PVOID receiveMessageAttributes,
     PLARGE_INTEGER timeout)
 {
     FakeAlpcEndpoint *endpoint = static_cast<FakeAlpcEndpoint *>(portHandle);
@@ -443,6 +535,18 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
                            endpoint->closed))) {
         return STATUS_PORT_DISCONNECTED;
     }
+    if (!serverHandle && sendMessage == static_cast<PALPC_PORT_MESSAGE>(0) &&
+        receiveMessage != static_cast<PALPC_PORT_MESSAGE>(0)) {
+        g_alpc.lastEndpointReceiveTimeout =
+            timeout != static_cast<PLARGE_INTEGER>(0) ? timeout->QuadPart : 0;
+        std::lock_guard<std::mutex> guard(g_alpc.mutex);
+        if (g_alpc.queue.empty() &&
+            g_alpc.emptyEndpointPollStatus != STATUS_TIMEOUT) {
+            const NTSTATUS pollStatus = g_alpc.emptyEndpointPollStatus;
+            g_alpc.emptyEndpointPollStatus = STATUS_TIMEOUT;
+            return pollStatus;
+        }
+    }
     /* A receive-only call is used by both connection-port and communication
        port workers.  The caller identifies the queue entry by its endpoint. */
     if (sendMessage == static_cast<PALPC_PORT_MESSAGE>(0) &&
@@ -463,6 +567,9 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
             g_alpc.queue.pop_front();
             g_alpc.current = selected;
             g_alpc.hasCurrent = true;
+            if (selected.endpoint != static_cast<FakeAlpcEndpoint *>(0)) {
+                selected.endpoint->pendingSync = selected.sync;
+            }
         }
         g_alpc_thread_current = g_alpc.current;
         if (bufferLength == static_cast<PSIZE_T>(0) ||
@@ -472,17 +579,68 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
         std::memset(receiveMessage, 0, static_cast<std::size_t>(*bufferLength));
         std::memcpy(receiveMessage, g_alpc.current.bytes.data(),
                     static_cast<std::size_t>(g_alpc.current.length));
-        *bufferLength = g_alpc.current.length;
+        if (!serverHandle &&
+            (receiveMessage->u2.s2.Type & 0x0fffU) ==
+                kAlpcConnectionCompleteType) {
+            std::lock_guard<std::mutex> guard(g_alpc.mutex);
+            ++g_alpc.connectionCompleteDeliveries;
+        }
+        /* Match native ALPC: BufferLength is an in/out capacity and is not
+           guaranteed to be rewritten on success. */
+        if (receiveMessageAttributes != static_cast<PVOID>(0) &&
+            g_alpc_thread_current.endpoint !=
+                static_cast<FakeAlpcEndpoint *>(0)) {
+            PALPC_PORT_CONTEXT_ATTRIBUTES attributes =
+                static_cast<PALPC_PORT_CONTEXT_ATTRIBUTES>(
+                    receiveMessageAttributes);
+            if ((attributes->Header.AllocatedAttributes &
+                 ALPC_PORT_MESSAGE_CONTEXT_ATTRIBUTE) != 0U) {
+                attributes->Header.ValidAttributes |=
+                    ALPC_PORT_MESSAGE_CONTEXT_ATTRIBUTE;
+                attributes->Context.PortContext =
+                    g_alpc.portContextOverride != static_cast<PVOID>(0)
+                        ? g_alpc.portContextOverride
+                        : g_alpc_thread_current.endpoint->serverContext;
+                attributes->Context.MessageId = receiveMessage->MessageId;
+            }
+        }
         return STATUS_SUCCESS;
     }
     /* A reply is sent from ProcessClientEvent after a request was received.
        The current thread's queue metadata identifies the waiting sender. */
     if ((flags & static_cast<ULONG>(ALPC_PORT_SEND_FLAG_REPLY_MESSAGE)) != 0U &&
-        sendMessage != static_cast<PALPC_PORT_MESSAGE>(0) &&
-        g_alpc_thread_current.sync != static_cast<FakeAlpcSync *>(0)) {
-        FakeAlpcSync *sync = g_alpc_thread_current.sync;
+        sendMessage != static_cast<PALPC_PORT_MESSAGE>(0)) {
+        FakeAlpcSync *sync = static_cast<FakeAlpcSync *>(0);
         const SIZE_T length = static_cast<SIZE_T>(sendMessage->u1.s1.TotalLength);
+        NTSTATUS injectedReplyStatus = STATUS_SUCCESS;
 
+        {
+            std::lock_guard<std::mutex> guard(g_alpc.mutex);
+            sync = g_alpc_thread_current.sync !=
+                           static_cast<FakeAlpcSync *>(0)
+                       ? g_alpc_thread_current.sync
+                       : endpoint->pendingSync;
+            if (endpoint->pendingSync == sync) {
+                endpoint->pendingSync = static_cast<FakeAlpcSync *>(0);
+            }
+            if (receiveMessage == static_cast<PALPC_PORT_MESSAGE>(0) &&
+                bufferLength == static_cast<PSIZE_T>(0)) {
+                ++g_alpc.replySendOnlyCalls;
+            } else {
+                ++g_alpc.replyWithReceiveCalls;
+            }
+            g_alpc.lastReplyControlId =
+                static_cast<PALPC_PORT_FRAME>(
+                    static_cast<void *>(sendMessage))->ControlId;
+            injectedReplyStatus = g_alpc.nextReplyStatus;
+            g_alpc.nextReplyStatus = STATUS_SUCCESS;
+        }
+        if (sync == static_cast<FakeAlpcSync *>(0)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (injectedReplyStatus != STATUS_SUCCESS) {
+            return injectedReplyStatus;
+        }
         if (length < static_cast<SIZE_T>(sizeof(ALPC_PORT_MESSAGE)) ||
             length > kAlpcCapacity) {
             return STATUS_DATA_ERROR;
@@ -490,6 +648,10 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
         {
             std::lock_guard<std::mutex> guard(sync->mutex);
             std::memcpy(sync->reply.data(), sendMessage, static_cast<std::size_t>(length));
+            reinterpret_cast<PALPC_PORT_MESSAGE>(
+                sync->reply.data())->u2.s2.Type = static_cast<USHORT>(
+                    (sendMessage->u2.s2.Type & 0x0fffU) |
+                    g_alpc.nativeTypeHighBits);
             sync->replyLength = length;
             sync->status = STATUS_SUCCESS;
             sync->replied = true;
@@ -508,6 +670,12 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
             : static_cast<FakeAlpcSync *>(0);
     FakeAlpcQueued queued = make_alpc_message(sendMessage, endpoint,
                                                static_cast<FakeAlpcConnect *>(0), sync);
+    reinterpret_cast<PALPC_PORT_MESSAGE>(queued.bytes.data())->u2.s2.Type =
+        static_cast<USHORT>(sync != static_cast<FakeAlpcSync *>(0)
+                                ? (ALPC_PORT_MESSAGE_TYPE_REQUEST & 0x0fffU) |
+                                      g_alpc.nativeTypeHighBits
+                                : (ALPC_PORT_MESSAGE_TYPE_DATAGRAM & 0x0fffU) |
+                                      g_alpc.nativeTypeHighBits);
     if (g_alpc.mutateNextRequest) {
         g_alpc.mutateNextRequest = false;
         queued.bytes[0] = 0;
@@ -515,11 +683,22 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
         queued.bytes[2] = 0;
         queued.bytes[3] = static_cast<unsigned char>(sizeof(ALPC_PORT_MESSAGE) - 1U);
     }
+    if (g_alpc.appendTrailingByteNextRequest &&
+        queued.length < kAlpcCapacity) {
+        PALPC_PORT_MESSAGE malformed =
+            reinterpret_cast<PALPC_PORT_MESSAGE>(queued.bytes.data());
+        g_alpc.appendTrailingByteNextRequest = false;
+        queued.bytes[queued.length] = 0xA5U;
+        ++queued.length;
+        ++malformed->u1.s1.TotalLength;
+        ++malformed->u1.s1.DataLength;
+    }
     enqueue_alpc_message(queued);
     if (sync != static_cast<FakeAlpcSync *>(0)) {
         const NTSTATUS processStatus = AlpcPort_ProcessClientEvent(
             g_alpc.serverContext, static_cast<HANDLE>(endpoint));
-        if (!NT_SUCCESS(processStatus) && !sync->replied) {
+        if ((processStatus == STATUS_TIMEOUT || !NT_SUCCESS(processStatus)) &&
+            !sync->replied) {
             delete sync;
             return processStatus;
         }
@@ -536,7 +715,7 @@ static NTSTATUS NTAPI fake_alpc_send_wait_receive(
             std::memset(receiveMessage, 0, static_cast<std::size_t>(*bufferLength));
             std::memcpy(receiveMessage, sync->reply.data(),
                         static_cast<std::size_t>(sync->replyLength));
-            *bufferLength = sync->replyLength;
+            /* Preserve the caller-provided capacity, as the real syscall may. */
         }
         const NTSTATUS result = sync->status;
         delete sync;
@@ -555,6 +734,7 @@ static ALPC_PORT_CLIENT_APIS fake_alpc_client_apis(void)
     api.pfnNtAlpcConnectPort = fake_alpc_connect;
     api.pfnNtAlpcSendWaitReceivePort = fake_alpc_send_wait_receive;
     api.pfnNtAlpcDisconnectPort = fake_alpc_disconnect;
+    api.pfnNtQuerySystemTime = fake_alpc_query_system_time;
     return api;
 }
 
@@ -570,6 +750,7 @@ static ALPC_PORT_SERVER_APIS fake_alpc_server_apis(void)
     api.pfnNtAlpcCompleteConnectPort = fake_alpc_complete_connect;
     api.pfnNtAlpcSendWaitReceivePort = fake_alpc_send_wait_receive;
     api.pfnNtAlpcDisconnectPort = fake_alpc_disconnect;
+    api.pfnNtQuerySystemTime = fake_alpc_query_system_time;
     return api;
 }
 
@@ -582,17 +763,62 @@ struct AlpcCallbackState
     uint32_t closeCalls;
     uint32_t lastControlId;
     NTSTATUS syncStatus;
+    NTSTATUS asyncStatus;
     std::vector<unsigned char> lastAsync;
 
     AlpcCallbackState()
         : preConnectCalls(0U), postConnectCalls(0U), syncCalls(0U),
           asyncCalls(0U), closeCalls(0U), lastControlId(0U),
-          syncStatus(STATUS_SUCCESS), lastAsync()
+          syncStatus(STATUS_SUCCESS), asyncStatus(STATUS_SUCCESS), lastAsync()
     {
     }
 };
 
 static AlpcCallbackState *g_alpc_callbacks = static_cast<AlpcCallbackState *>(0);
+
+struct DeferredReplyState
+{
+    ALPC_PORT_SERVER_CONTEXT *server;
+    ALPC_PORT_REPLY_TOKEN token;
+    std::mutex mutex;
+    std::condition_variable condition;
+    NTSTATUS captureStatus;
+    NTSTATUS replyStatus;
+    NTSTATUS duplicateStatus;
+    bool captured;
+
+    DeferredReplyState()
+        : server(static_cast<ALPC_PORT_SERVER_CONTEXT *>(0)), token(), mutex(),
+          condition(), captureStatus(STATUS_UNSUCCESSFUL),
+          replyStatus(STATUS_UNSUCCESSFUL),
+          duplicateStatus(STATUS_UNSUCCESSFUL), captured(false)
+    {
+    }
+};
+
+static DeferredReplyState *g_deferred_reply =
+    static_cast<DeferredReplyState *>(0);
+
+static NTSTATUS alpc_deferred_request(HANDLE clientPort,
+                                      const ALPC_PORT_CLIENT_ID *,
+                                      uint32_t, uint8_t *, ULONG *, ULONG,
+                                      PVOID)
+{
+    DeferredReplyState *state = g_deferred_reply;
+    if (state == static_cast<DeferredReplyState *>(0) ||
+        state->server == static_cast<ALPC_PORT_SERVER_CONTEXT *>(0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    state->captureStatus = AlpcPort_ServerCaptureRequest(
+        state->server, clientPort, &state->token);
+    {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        state->captured = true;
+    }
+    state->condition.notify_all();
+    return state->captureStatus == STATUS_SUCCESS
+               ? STATUS_PENDING : state->captureStatus;
+}
 
 static void alpc_pre_connect(uint32_t *responseControlId, uint8_t *deny, PVOID)
 {
@@ -641,7 +867,9 @@ static NTSTATUS alpc_async_request(HANDLE, const ALPC_PORT_CLIENT_ID *,
         ++g_alpc_callbacks->asyncCalls;
         g_alpc_callbacks->lastAsync.assign(payload, payload + payloadLength);
     }
-    return STATUS_SUCCESS;
+    return g_alpc_callbacks != static_cast<AlpcCallbackState *>(0)
+               ? g_alpc_callbacks->asyncStatus
+               : STATUS_SUCCESS;
 }
 
 static void alpc_close(HANDLE, const ALPC_PORT_CLIENT_ID *, PVOID)
@@ -669,10 +897,11 @@ struct AlpcFixture
     ALPC_PORT_SERVER_EVENTS events;
     AlpcCallbackState callbacks;
 
-    AlpcFixture()
+    AlpcFixture(USHORT nativeTypeHighBits = 0U)
         : server(), client(), serverConfig(), clientConfig(), events(),
           callbacks()
     {
+        g_alpc.nativeTypeHighBits = nativeTypeHighBits;
         alpc_fill_name(&serverConfig.portName);
         serverConfig.maxMessageLength = kAlpcCapacity;
         serverConfig.maxClients = 8U;
@@ -698,6 +927,7 @@ struct AlpcFixture
         AlpcPort_Disconnect(&client);
         AlpcPort_ServerClose(&server);
         g_alpc_callbacks = static_cast<AlpcCallbackState *>(0);
+        g_deferred_reply = static_cast<DeferredReplyState *>(0);
         g_alpc.reset();
     }
 
@@ -715,8 +945,8 @@ struct ReplyCapture
     }
 };
 
-static NTSTATUS alpc_reply_capture(const uint8_t *buffer, ULONG length,
-                                   PVOID context)
+static NTSTATUS NTAPI alpc_reply_capture(const uint8_t *buffer, ULONG length,
+                                         PVOID context)
 {
     ReplyCapture *capture = static_cast<ReplyCapture *>(context);
 
@@ -763,6 +993,8 @@ TEST_CASE("ALPC performs synchronous and asynchronous exchanges", "[alpc][transp
     const unsigned char asyncMessage[] = {'a', 's', 'y', 'n', 'c'};
     const std::vector<unsigned char> expectedInline = {'H', 'E', 'l', 'L', 'O'};
 
+    REQUIRE(g_alpc.connectionCompleteDeliveries == 1U);
+
     REQUIRE(AlpcPort_SendMessage(&fixture.client, inlineMessage,
                                  static_cast<ULONG>(sizeof(inlineMessage)), 7U,
                                  0U, alpc_reply_capture, &capture, nullptr) ==
@@ -771,6 +1003,9 @@ TEST_CASE("ALPC performs synchronous and asynchronous exchanges", "[alpc][transp
     REQUIRE(capture.bytes == expectedInline);
     REQUIRE(fixture.callbacks.syncCalls == 1U);
     REQUIRE(fixture.callbacks.lastControlId == 7U);
+    REQUIRE(g_alpc.replySendOnlyCalls == 1U);
+    REQUIRE(g_alpc.replyWithReceiveCalls == 0U);
+    REQUIRE(g_alpc.lastReplyControlId == 7U);
 
     REQUIRE(AlpcPort_SendMessage(&fixture.client, asyncMessage,
                                  static_cast<ULONG>(sizeof(asyncMessage)), 9U,
@@ -781,6 +1016,107 @@ TEST_CASE("ALPC performs synchronous and asynchronous exchanges", "[alpc][transp
                                          fixture.client.portHandle) == STATUS_SUCCESS);
     REQUIRE(fixture.callbacks.asyncCalls == 1U);
     REQUIRE(fixture.callbacks.lastAsync.size() == sizeof(asyncMessage));
+}
+
+TEST_CASE("ALPC accepts WOW64 Native message type flags",
+          "[alpc][transport][wow64]")
+{
+    AlpcFixture fixture(static_cast<USHORT>(0x3000U));
+    ReplyCapture capture = {};
+    const unsigned char syncMessage[] = {'w', 'o', 'w'};
+    const unsigned char asyncMessage[] = {'6', '4'};
+    const std::vector<unsigned char> expectedReply = {'W', 'o', 'W'};
+    ALPC_PORT_MESSAGE nativeControl = {};
+
+    /* The fake provider applies 0x3000 to the connection request, completion
+       marker, request/datagram and reply types, matching observed WOW64 ALPC
+       traffic rather than only exercising a helper in isolation. */
+    REQUIRE(g_alpc.connectionCompleteDeliveries == 1U);
+    REQUIRE(AlpcPort_SendMessage(
+                &fixture.client, syncMessage,
+                static_cast<ULONG>(sizeof(syncMessage)), 0x64U, 0U,
+                alpc_reply_capture, &capture, nullptr) == STATUS_SUCCESS);
+    REQUIRE(capture.bytes == expectedReply);
+    REQUIRE(fixture.callbacks.syncCalls == 1U);
+
+    REQUIRE(AlpcPort_SendMessage(
+                &fixture.client, asyncMessage,
+                static_cast<ULONG>(sizeof(asyncMessage)), 0x65U,
+                ALPC_PORT_SEND_FLAG_ASYNC,
+                static_cast<AlpcPort_SyncReplyCallback>(0),
+                static_cast<PVOID>(0), nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
+
+    nativeControl.u1.s1.TotalLength =
+        static_cast<USHORT>(sizeof(ALPC_PORT_MESSAGE));
+    nativeControl.u1.s1.DataLength = 0U;
+    nativeControl.u2.s2.Type = static_cast<USHORT>(0x300CU);
+    enqueue_alpc_message(make_alpc_message(
+        &nativeControl, static_cast<FakeAlpcEndpoint *>(
+                            fixture.client.portHandle),
+        static_cast<FakeAlpcConnect *>(0), static_cast<FakeAlpcSync *>(0)));
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.server.clientCount == 1U);
+}
+
+TEST_CASE("ALPC connection completion consumes the remaining connect deadline",
+          "[alpc][connect][timeout]")
+{
+    ALPC_PORT_SERVER_CONTEXT server = {};
+    ALPC_PORT_CLIENT_CONTEXT client = {};
+    ALPC_PORT_SERVER_CONFIG serverConfig = {};
+    ALPC_PORT_CLIENT_CONFIG clientConfig = {};
+    ALPC_PORT_SERVER_EVENTS events = {};
+    AlpcCallbackState callbacks = {};
+    LARGE_INTEGER timeout = {};
+
+    g_alpc.reset();
+    g_alpc_system_time = 1000;
+    g_alpc.connectElapsedTicks = 400;
+    timeout.QuadPart = -1000;
+    alpc_fill_name(&serverConfig.portName);
+    serverConfig.maxMessageLength = kAlpcCapacity;
+    serverConfig.maxClients = 1U;
+    serverConfig.api = fake_alpc_server_apis();
+    alpc_fill_name(&clientConfig.portName);
+    clientConfig.maxMessageLength = kAlpcCapacity;
+    clientConfig.connectTimeout = &timeout;
+    clientConfig.api = fake_alpc_client_apis();
+    events.onPreConnect = alpc_pre_connect;
+    events.onPostConnect = alpc_post_connect;
+    g_alpc_callbacks = &callbacks;
+
+    REQUIRE(AlpcPort_ServerCreate(&serverConfig, &server) == STATUS_SUCCESS);
+    g_alpc.serverContext = &server;
+    REQUIRE(AlpcPort_Register_ServerEvtCallback(&server, &events) != 0U);
+    REQUIRE(AlpcPort_Connect(&clientConfig, &client) == STATUS_SUCCESS);
+    REQUIRE(g_alpc.lastConnectTimeout == -1000);
+    REQUIRE(g_alpc.lastEndpointReceiveTimeout == -600);
+    REQUIRE(g_alpc.connectionCompleteDeliveries == 1U);
+
+    AlpcPort_Disconnect(&client);
+    AlpcPort_ServerClose(&server);
+    g_alpc_callbacks = static_cast<AlpcCallbackState *>(0);
+    g_alpc.reset();
+    g_alpc_system_time = 0;
+}
+
+TEST_CASE("ALPC disconnects an endpoint when a synchronous reply cannot be delivered",
+          "[alpc][reply][failure]")
+{
+    AlpcFixture fixture = {};
+    const unsigned char message[] = {'r', 'e', 'p', 'l', 'y'};
+
+    g_alpc.nextReplyStatus = STATUS_TIMEOUT;
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 0x71U,
+                                 0U, nullptr, nullptr, nullptr) ==
+            STATUS_TIMEOUT);
+    REQUIRE(fixture.server.clientCount == 0U);
+    REQUIRE(fixture.callbacks.closeCalls == 1U);
+    REQUIRE(!g_alpc.endpoints.empty());
+    REQUIRE(g_alpc.endpoints.front()->closed);
 }
 
 TEST_CASE("ALPC propagates callback failure and rejects malformed requests",
@@ -807,6 +1143,284 @@ TEST_CASE("ALPC propagates callback failure and rejects malformed requests",
             STATUS_DATA_ERROR);
     REQUIRE(capture.calls == 1U);
     REQUIRE(capture.bytes.empty());
+
+    g_alpc.appendTrailingByteNextRequest = true;
+    capture = ReplyCapture();
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 4U, 0U,
+                                 alpc_reply_capture, &capture, nullptr) ==
+            STATUS_DATA_ERROR);
+    REQUIRE(capture.calls == 1U);
+    REQUIRE(capture.bytes.empty());
+}
+
+TEST_CASE("ALPC timeout helpers preserve one absolute deadline",
+          "[alpc][timeout]")
+{
+    LARGE_INTEGER timeout = {};
+    LARGE_INTEGER deadline = {};
+    LARGE_INTEGER remaining = {};
+
+    timeout.QuadPart = 0;
+    deadline.QuadPart = 1;
+    REQUIRE(AlpcPort_NormalizeTimeout(fake_alpc_query_system_time, &timeout,
+                                      &deadline) == STATUS_TIMEOUT);
+    REQUIRE(deadline.QuadPart == 0);
+    remaining.QuadPart = 1;
+    REQUIRE(AlpcPort_RemainingTimeout(fake_alpc_query_system_time, &deadline,
+                                      &remaining) == STATUS_TIMEOUT);
+    REQUIRE(remaining.QuadPart == 0);
+
+    g_alpc_system_time = 1000;
+    timeout.QuadPart = -500;
+    REQUIRE(AlpcPort_NormalizeTimeout(fake_alpc_query_system_time, &timeout,
+                                      &deadline) == STATUS_SUCCESS);
+    REQUIRE(deadline.QuadPart == 1500);
+    g_alpc_system_time = 1200;
+    REQUIRE(AlpcPort_RemainingTimeout(fake_alpc_query_system_time, &deadline,
+                                      &remaining) == STATUS_SUCCESS);
+    REQUIRE(remaining.QuadPart == -300);
+    g_alpc_system_time = 1500;
+    REQUIRE(AlpcPort_RemainingTimeout(fake_alpc_query_system_time, &deadline,
+                                      &remaining) == STATUS_TIMEOUT);
+    REQUIRE(remaining.QuadPart == 0);
+
+    timeout.QuadPart = (std::numeric_limits<LONGLONG>::min)();
+    REQUIRE(AlpcPort_NormalizeTimeout(fake_alpc_query_system_time, &timeout,
+                                      &deadline) == STATUS_INTEGER_OVERFLOW);
+    g_alpc_system_time = (std::numeric_limits<LONGLONG>::max)() - 10;
+    timeout.QuadPart = -20;
+    REQUIRE(AlpcPort_NormalizeTimeout(fake_alpc_query_system_time, &timeout,
+                                      &deadline) == STATUS_INTEGER_OVERFLOW);
+}
+
+TEST_CASE("ALPC shared queue validates native PortContext",
+          "[alpc][routing]")
+{
+    AlpcFixture fixture = {};
+    FakeAlpcEndpoint *endpoint = static_cast<FakeAlpcEndpoint *>(
+        fixture.client.portHandle);
+    const std::uintptr_t nativeToken = reinterpret_cast<std::uintptr_t>(
+        endpoint->serverContext);
+    const std::uintptr_t invalidToken =
+        nativeToken == (std::numeric_limits<std::uintptr_t>::max)()
+            ? nativeToken - 1U
+            : nativeToken + 1U;
+    const unsigned char message[] = {'r', 'o', 'u', 't', 'e'};
+
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 0x31U,
+                                 ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                                 nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
+
+    g_alpc.portContextOverride = reinterpret_cast<PVOID>(invalidToken);
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 0x32U,
+                                 ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                                 nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_DATA_ERROR);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
+    g_alpc.portContextOverride = static_cast<PVOID>(0);
+}
+
+TEST_CASE("ALPC native PortContext survives same-process endpoint ABA",
+          "[alpc][routing][lifetime][token]")
+{
+    AlpcFixture fixture = {};
+    ALPC_PORT_CLIENT_CONTEXT replacement = {};
+    ALPC_PORT_ENDPOINT_TOKEN firstPublicToken = {};
+    ALPC_PORT_ENDPOINT_TOKEN replacementPublicToken = {};
+    FakeAlpcEndpoint *firstEndpoint = static_cast<FakeAlpcEndpoint *>(
+        fixture.client.portHandle);
+    FakeAlpcEndpoint *replacementEndpoint = nullptr;
+    PVOID staleNativeToken = firstEndpoint->serverContext;
+    const unsigned char message[] = {'a', 'b', 'a'};
+
+    REQUIRE(staleNativeToken != nullptr);
+    REQUIRE(AlpcPort_ServerGetClientToken(
+                &fixture.server, fixture.client.portHandle,
+                &firstPublicToken) == STATUS_SUCCESS);
+    /* Native must retain an opaque scalar, never the freeable record address
+       exposed as the opaque half of the public endpoint token. */
+    REQUIRE(staleNativeToken != firstPublicToken.opaque);
+
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(&fixture.server,
+                                                  &firstPublicToken) ==
+            STATUS_SUCCESS);
+    REQUIRE(AlpcPort_Connect(&fixture.clientConfig, &replacement) ==
+            STATUS_SUCCESS);
+    replacementEndpoint = static_cast<FakeAlpcEndpoint *>(
+        replacement.portHandle);
+    REQUIRE(replacementEndpoint->serverContext != nullptr);
+    REQUIRE(replacementEndpoint->serverContext != staleNativeToken);
+    REQUIRE(AlpcPort_ServerGetClientToken(
+                &fixture.server, replacement.portHandle,
+                &replacementPublicToken) == STATUS_SUCCESS);
+    REQUIRE(replacementEndpoint->serverContext !=
+            replacementPublicToken.opaque);
+
+    /* A delayed frame from the disconnected endpoint retains its old token.
+       Both fake endpoints use the same zero ClientId, so ClientId validation
+       cannot accidentally make this regression pass. */
+    g_alpc.portContextOverride = staleNativeToken;
+    REQUIRE(AlpcPort_SendMessage(
+                &replacement, message, static_cast<ULONG>(sizeof(message)),
+                0x34U, ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_DATA_ERROR);
+    REQUIRE(fixture.callbacks.asyncCalls == 0U);
+
+    /* Model the address-reuse half of the ABA explicitly: an old pointer
+       context whose numeric value now equals the replacement record address
+       must still not route to that record. */
+    g_alpc.portContextOverride = replacementPublicToken.opaque;
+    REQUIRE(AlpcPort_SendMessage(
+                &replacement, message, static_cast<ULONG>(sizeof(message)),
+                0x35U, ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_DATA_ERROR);
+    REQUIRE(fixture.callbacks.asyncCalls == 0U);
+
+    g_alpc.portContextOverride = static_cast<PVOID>(0);
+    REQUIRE(AlpcPort_SendMessage(
+                &replacement, message, static_cast<ULONG>(sizeof(message)),
+                0x36U, ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
+
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(
+                &fixture.server, &replacementPublicToken) == STATUS_SUCCESS);
+    AlpcPort_Disconnect(&replacement);
+}
+
+TEST_CASE("ALPC shared queue distinguishes callback status from native close",
+          "[alpc][routing][lifetime]")
+{
+    AlpcFixture fixture = {};
+    const unsigned char message[] = {'s', 't', 'a', 'y'};
+    FakeAlpcEndpoint *endpoint = static_cast<FakeAlpcEndpoint *>(
+        fixture.client.portHandle);
+    ALPC_PORT_MESSAGE closed = {};
+
+    fixture.callbacks.asyncStatus = STATUS_PORT_DISCONNECTED;
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 0x41U,
+                                 ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                                 nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) ==
+            STATUS_PORT_DISCONNECTED);
+    REQUIRE(fixture.server.clientCount == 1U);
+    REQUIRE(fixture.callbacks.closeCalls == 0U);
+
+    fixture.callbacks.asyncStatus = STATUS_SUCCESS;
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, message,
+                                 static_cast<ULONG>(sizeof(message)), 0x42U,
+                                 ALPC_PORT_SEND_FLAG_ASYNC, nullptr, nullptr,
+                                 nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 2U);
+
+    closed.u1.s1.TotalLength =
+        static_cast<USHORT>(sizeof(ALPC_PORT_MESSAGE));
+    closed.u1.s1.DataLength = 0U;
+    closed.u2.s2.Type =
+        static_cast<USHORT>(ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED);
+    enqueue_alpc_message(make_alpc_message(&closed, endpoint, nullptr, nullptr));
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) ==
+            STATUS_PORT_DISCONNECTED);
+    REQUIRE(fixture.server.clientCount == 0U);
+    REQUIRE(fixture.callbacks.closeCalls == 1U);
+}
+
+TEST_CASE("ALPC deferred reply is one-shot and preserves control id",
+          "[alpc][deferred]")
+{
+    AlpcFixture fixture = {};
+    DeferredReplyState deferred = {};
+    ReplyCapture capture = {};
+    const unsigned char request[] = {'q'};
+    const unsigned char response[] = {'o', 'k'};
+    const std::vector<unsigned char> expectedResponse = {'o', 'k'};
+
+    deferred.server = &fixture.server;
+    g_deferred_reply = &deferred;
+    fixture.events.onSyncRequest = alpc_deferred_request;
+    REQUIRE(AlpcPort_Register_ServerEvtCallback(&fixture.server,
+                                                 &fixture.events) != 0U);
+
+    std::thread replyWorker([&deferred, &response] {
+        ALPC_PORT_REPLY_TOKEN first = {};
+        ALPC_PORT_REPLY_TOKEN duplicate = {};
+        {
+            std::unique_lock<std::mutex> lock(deferred.mutex);
+            deferred.condition.wait(lock, [&deferred] {
+                return deferred.captured;
+            });
+            first = deferred.token;
+            duplicate = deferred.token;
+        }
+        deferred.replyStatus = AlpcPort_ServerReply(
+            deferred.server, &first, response,
+            static_cast<ULONG>(sizeof(response)), STATUS_SUCCESS, nullptr);
+        deferred.duplicateStatus = AlpcPort_ServerReply(
+            deferred.server, &duplicate, response,
+            static_cast<ULONG>(sizeof(response)), STATUS_SUCCESS, nullptr);
+    });
+
+    REQUIRE(AlpcPort_SendMessage(&fixture.client, request,
+                                 static_cast<ULONG>(sizeof(request)), 0x55U,
+                                 0U, alpc_reply_capture, &capture, nullptr) ==
+            STATUS_SUCCESS);
+    replyWorker.join();
+    REQUIRE(deferred.captureStatus == STATUS_SUCCESS);
+    REQUIRE(deferred.replyStatus == STATUS_SUCCESS);
+    REQUIRE(deferred.duplicateStatus == STATUS_INVALID_PARAMETER);
+    REQUIRE(capture.bytes == expectedResponse);
+    REQUIRE(g_alpc.lastReplyControlId == 0x55U);
+    REQUIRE(List_Count(&fixture.server.pendingReplies) == 0U);
+    REQUIRE(g_alpc.replyWithReceiveCalls == 0U);
+    g_deferred_reply = static_cast<DeferredReplyState *>(0);
+}
+
+TEST_CASE("ALPC rejects a failed connection-complete wait",
+          "[alpc][connect][validation]")
+{
+    ALPC_PORT_SERVER_CONTEXT server = {};
+    ALPC_PORT_CLIENT_CONTEXT client = {};
+    ALPC_PORT_SERVER_CONFIG serverConfig = {};
+    ALPC_PORT_CLIENT_CONFIG clientConfig = {};
+    ALPC_PORT_SERVER_EVENTS events = {};
+    AlpcCallbackState callbacks = {};
+
+    alpc_fill_name(&serverConfig.portName);
+    serverConfig.maxMessageLength = kAlpcCapacity;
+    serverConfig.maxClients = 1U;
+    serverConfig.api = fake_alpc_server_apis();
+    alpc_fill_name(&clientConfig.portName);
+    clientConfig.maxMessageLength = kAlpcCapacity;
+    clientConfig.api = fake_alpc_client_apis();
+    events.onPreConnect = alpc_pre_connect;
+    events.onPostConnect = alpc_post_connect;
+    g_alpc_callbacks = &callbacks;
+
+    REQUIRE(AlpcPort_ServerCreate(&serverConfig, &server) == STATUS_SUCCESS);
+    g_alpc.serverContext = &server;
+    REQUIRE(AlpcPort_Register_ServerEvtCallback(&server, &events) != 0U);
+    g_alpc.emptyEndpointPollStatus = STATUS_PORT_DISCONNECTED;
+    REQUIRE(AlpcPort_Connect(&clientConfig, &client) ==
+            STATUS_PORT_DISCONNECTED);
+    REQUIRE(client.initialized == 0);
+    REQUIRE(client.portHandle == static_cast<HANDLE>(0));
+    REQUIRE(client.sendLock.initialized == 0U);
+    REQUIRE(client.receiveLock.initialized == 0U);
+    REQUIRE(client.lifetime.initialized == 0U);
+
+    AlpcPort_ServerClose(&server);
+    g_alpc_callbacks = static_cast<AlpcCallbackState *>(0);
+    g_alpc.reset();
 }
 
 TEST_CASE("ALPC disconnect removes a client exactly once", "[alpc][lifetime]")
@@ -824,4 +1438,105 @@ TEST_CASE("ALPC disconnect removes a client exactly once", "[alpc][lifetime]")
                                  static_cast<AlpcPort_SyncReplyCallback>(0),
                                  static_cast<PVOID>(0), nullptr) ==
             STATUS_PORT_DISCONNECTED);
+}
+
+TEST_CASE("ALPC endpoint tokens require both record identity and cookie",
+          "[alpc][lifetime][token]")
+{
+    AlpcFixture fixture = {};
+    ALPC_PORT_CLIENT_CONTEXT secondClient = {};
+    ALPC_PORT_ENDPOINT_TOKEN firstToken = {};
+    ALPC_PORT_ENDPOINT_TOKEN secondToken = {};
+    ALPC_PORT_ENDPOINT_TOKEN forgedStaleToken = {};
+    const unsigned char message[] = {'s', 'e', 'c', 'o', 'n', 'd'};
+
+    REQUIRE(AlpcPort_ServerGetClientToken(
+                &fixture.server, fixture.client.portHandle, &firstToken) ==
+            STATUS_SUCCESS);
+    REQUIRE(firstToken.opaque != nullptr);
+    REQUIRE(firstToken.cookie != 0U);
+
+    REQUIRE(AlpcPort_Connect(&fixture.clientConfig, &secondClient) ==
+            STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ServerGetClientToken(
+                &fixture.server, secondClient.portHandle, &secondToken) ==
+            STATUS_SUCCESS);
+    REQUIRE(secondToken.opaque != nullptr);
+    REQUIRE(secondToken.cookie != 0U);
+    REQUIRE(secondToken.cookie != firstToken.cookie);
+
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(&fixture.server,
+                                                  &firstToken) ==
+            STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.closeCalls == 1U);
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(&fixture.server,
+                                                  &firstToken) ==
+            STATUS_PORT_DISCONNECTED);
+
+    /* Model allocator-address or HANDLE reuse explicitly: even if a stale
+       caller presents the current record pointer, its old cookie must not
+       authorize disconnecting the replacement endpoint. */
+    forgedStaleToken.opaque = secondToken.opaque;
+    forgedStaleToken.cookie = firstToken.cookie;
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(&fixture.server,
+                                                  &forgedStaleToken) ==
+            STATUS_PORT_DISCONNECTED);
+    REQUIRE(fixture.server.clientCount == 1U);
+    REQUIRE(fixture.callbacks.closeCalls == 1U);
+
+    REQUIRE(AlpcPort_SendMessage(
+                &secondClient, message, static_cast<ULONG>(sizeof(message)),
+                0x61U, ALPC_PORT_SEND_FLAG_ASYNC,
+                static_cast<AlpcPort_SyncReplyCallback>(0),
+                static_cast<PVOID>(0), nullptr) == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
+
+    REQUIRE(AlpcPort_ServerDisconnectClientToken(&fixture.server,
+                                                  &secondToken) ==
+            STATUS_SUCCESS);
+    REQUIRE(fixture.server.clientCount == 0U);
+    REQUIRE(fixture.callbacks.closeCalls == 2U);
+    AlpcPort_Disconnect(&secondClient);
+}
+
+TEST_CASE("ALPC dedicated receive lock does not block sends",
+          "[alpc][transport][concurrency]")
+{
+    AlpcFixture fixture = {};
+    const unsigned char message[] = {'f', 'u', 'l', 'l', '-', 'd', 'u', 'p', 'l', 'e', 'x'};
+    std::mutex completionMutex;
+    std::condition_variable completionCondition;
+    NTSTATUS sendStatus = STATUS_UNSUCCESSFUL;
+    bool sendCompleted = false;
+
+    REQUIRE(AlpcPort_ClientAcquire(&fixture.client) != 0U);
+    AlpcPort_ClientReceiveLock(&fixture.client);
+    std::thread sender([&] {
+        sendStatus = AlpcPort_SendMessage(
+            &fixture.client, message, static_cast<ULONG>(sizeof(message)),
+            0x77U, ALPC_PORT_SEND_FLAG_ASYNC,
+            static_cast<AlpcPort_SyncReplyCallback>(0),
+            static_cast<PVOID>(0), nullptr);
+        {
+            std::lock_guard<std::mutex> guard(completionMutex);
+            sendCompleted = true;
+        }
+        completionCondition.notify_one();
+    });
+
+    bool completedWhileReceiveLocked = false;
+    {
+        std::unique_lock<std::mutex> lock(completionMutex);
+        completedWhileReceiveLocked = completionCondition.wait_for(
+            lock, std::chrono::seconds(2), [&] { return sendCompleted; });
+    }
+    AlpcPort_ClientReceiveUnlock(&fixture.client);
+    AlpcPort_ClientRelease(&fixture.client);
+    sender.join();
+
+    REQUIRE(completedWhileReceiveLocked);
+    REQUIRE(sendStatus == STATUS_SUCCESS);
+    REQUIRE(AlpcPort_ProcessBlockedEvent(&fixture.server) == STATUS_SUCCESS);
+    REQUIRE(fixture.callbacks.asyncCalls == 1U);
 }

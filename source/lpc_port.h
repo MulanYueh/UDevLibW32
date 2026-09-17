@@ -266,6 +266,37 @@ typedef struct _LPC_PORT_MESSAGE {
     } u3;
 } LPC_PORT_MESSAGE, *PLPC_PORT_MESSAGE;
 
+/* A WOW64 process must use the 64-bit LPC wire ABI even though its own
+ * pointers are 32-bit.  Keep explicit fixed-width forms rather than relying
+ * on USE_LPC6432 or on whichever PORT_MESSAGE spelling an SDK exposes. */
+typedef struct _LPC_PORT_CLIENT_ID64 {
+    uint64_t UniqueProcess;
+    uint64_t UniqueThread;
+} LPC_PORT_CLIENT_ID64, *PLPC_PORT_CLIENT_ID64;
+
+typedef struct _LPC_PORT_MESSAGE64 {
+    union {
+        struct {
+            USHORT DataLength;
+            USHORT TotalLength;
+        } s1;
+        ULONG Length;
+    } u1;
+    union {
+        struct {
+            USHORT Type;
+            USHORT DataInfoOffset;
+        } s2;
+        ULONG ZeroInit;
+    } u2;
+    LPC_PORT_CLIENT_ID64 ClientId;
+    ULONG MessageId;
+    union {
+        uint64_t ClientViewSize;
+        ULONG CallbackId;
+    } u3;
+} LPC_PORT_MESSAGE64, *PLPC_PORT_MESSAGE64;
+
 typedef struct _LPC_PORT_VIEW {
     ULONG Length;
     HANDLE SectionHandle;
@@ -280,6 +311,21 @@ typedef struct _LPC_REMOTE_PORT_VIEW {
     SIZE_T ViewSize;
     PVOID ViewBase;
 } LPC_REMOTE_PORT_VIEW, *PLPC_REMOTE_PORT_VIEW;
+
+typedef struct _LPC_PORT_VIEW64 {
+    ULONG Length;
+    uint64_t SectionHandle;
+    ULONG SectionOffset;
+    uint64_t ViewSize;
+    uint64_t ViewBase;
+    uint64_t ViewRemoteBase;
+} LPC_PORT_VIEW64, *PLPC_PORT_VIEW64;
+
+typedef struct _LPC_REMOTE_PORT_VIEW64 {
+    ULONG Length;
+    uint64_t ViewSize;
+    uint64_t ViewBase;
+} LPC_REMOTE_PORT_VIEW64, *PLPC_REMOTE_PORT_VIEW64;
 #pragma pack(pop)
 
 #pragma pack(push, 8)
@@ -306,9 +352,24 @@ typedef struct _LPC_HEADER {
     } u1;
     UCHAR data[ANYSIZE_ARRAY];
 } LPC_HEADER, *PLPC_HEADER;
+
+typedef struct _LPC_HEADER64 {
+    LPC_PORT_MESSAGE64 header;
+    ULONG ControlId;
+    union {
+        struct {
+            ULONG ulUseSharedMemory : 1;
+            ULONG ulUseAsyncMethod : 1;
+            ULONG ulReserved : 30;
+        } s1;
+        ULONG options;
+    } u1;
+    UCHAR data[ANYSIZE_ARRAY];
+} LPC_HEADER64, *PLPC_HEADER64;
 #pragma pack(pop)
 
 #define LPC_HEADER_DATA_OFFSET ((size_t)offsetof(LPC_HEADER, data))
+#define LPC_HEADER64_DATA_OFFSET ((size_t)offsetof(LPC_HEADER64, data))
 
 /**
  * Receives a synchronous reply on the client thread that called
@@ -421,6 +482,10 @@ typedef NTSTATUS (NTAPI *typedef_NtRequestPort)(HANDLE PortHandle, PLPC_PORT_MES
 typedef NTSTATUS (NTAPI *typedef_NtRequestWaitReplyPort)(HANDLE PortHandle,
                                                           PLPC_PORT_MESSAGE RequestMessage,
                                                           PLPC_PORT_MESSAGE ReplyMessage);
+typedef NTSTATUS (NTAPI *typedef_NtQueryInformationProcess)(
+    HANDLE ProcessHandle, ULONG ProcessInformationClass,
+    PVOID ProcessInformation, ULONG ProcessInformationLength,
+    PULONG ReturnLength);
 
 /** Client-side Native API table.  All members are required. */
 typedef struct _LPC_CLIENT_APIS {
@@ -432,6 +497,9 @@ typedef struct _LPC_CLIENT_APIS {
     typedef_RtlFreeUnicodeString pfnRtlFreeUnicodeString;
     typedef_NtRequestPort pfnNtRequestPort; /* Required for async datagrams. */
     typedef_NtRequestWaitReplyPort pfnNtRequestWaitReplyPort; /* Required for sync sends. */
+    /* Required by 32-bit user-mode builds to select native x86 versus WOW64
+     * wire structures; unused by native 64-bit and kernel-mode builds. */
+    typedef_NtQueryInformationProcess pfnNtQueryInformationProcess;
 } LPC_CLIENT_APIS, *PLPC_CLIENT_APIS;
 
 /* NtRequestWaitReplyPort has no timeout argument.  A client-side timeout
@@ -460,6 +528,10 @@ typedef struct _LPC_CLIENT_CONTEXT {
     HANDLE hSectionHandle;
     UNICODE_STRING ustrLPCName;
     LPC_PORT_VIEW client_view;
+    /* Non-zero when Native expects PORT_MESSAGE64/PORT_VIEW64. */
+    uint8_t use64BitWire;
+    /* Maximum total frame length returned by NtConnectPort. */
+    ULONG negotiatedMaxMessageLength;
     LPC_CLIENT_APIS api;
     /* Serializes section-backed transactions and protects disconnect. */
     LPC_PORT_LOCK sendLock;
@@ -500,6 +572,9 @@ typedef struct _LPC_SERVER_APIS {
     typedef_NtReplyPort pfnNtReplyPort; /* Required synchronous reply. */
     /* Optional native extension. NULL disables timed receive. */
     typedef_NtReplyWaitReceivePortEx pfnNtReplyWaitReceivePortEx;
+    /* Required by 32-bit user-mode builds to select native x86 versus WOW64
+     * wire structures; unused by native 64-bit and kernel-mode builds. */
+    typedef_NtQueryInformationProcess pfnNtQueryInformationProcess;
 } LPC_SERVER_APIS, *PLPC_SERVER_APIS;
 
 /**
@@ -519,12 +594,15 @@ typedef struct _LPC_SERVER_CONFIG {
 } LPC_SERVER_CONFIG, *PLPC_SERVER_CONFIG;
 
 /* Internal list entry owned by LPC_SERVER_CONTEXT; applications should not
- * create or modify this structure.  Its address is passed as Native
- * PortContext so the receive path can recover the communication handle.  It
- * is intentionally the first member because list.h accepts object pointers. */
+ * create or modify this structure.  Each accepted endpoint receives a
+ * process/module-wide opaque PortContext token.  The token is never
+ * dereferenced or reused, so a delayed native message cannot identify a new
+ * record that happens to occupy the same address.  listEntry remains first
+ * because list.h accepts object pointers. */
 typedef struct _LPC_SERVER_CLIENT_INFO {
     LIST_ELEM listEntry;
     HANDLE hLPCPortClientHandle;
+    PVOID portContextToken;
     LPC_REMOTE_PORT_VIEW client_view;
     uint32_t controlId;
     /* Serializes receive/callback processing for this endpoint.  The lock is
@@ -549,6 +627,8 @@ typedef struct _LPC_SERVER_CONTEXT {
     LIST clientList;
     uint32_t clientCount;
     uint32_t maxClients;
+    /* Non-zero when Native expects PORT_MESSAGE64/PORT_VIEW64. */
+    uint8_t use64BitWire;
     LPC_PORT_LOCK lockWord;
     LPC_PORT_LIFETIME lifetime;
     /* Published with an interlocked store; zero means closed. */
@@ -620,10 +700,10 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG lpClientCfg, PLPC_CLIENT_CONTEXT lpL
  * reply callback is ignored in that mode.  Synchronous sends use
  * NtRequestWaitReplyPort and optionally call `pfnSyncReplyCallback` after a
  * valid reply is received.  `useAsyncMode` and `useSharedMemory` cannot both
- * be non-zero.  Payloads larger than LPC_MESSAGE_MAX_PACK_SIZE are moved to
- * the negotiated section automatically for synchronous sends; large async
- * sends return STATUS_NOT_SUPPORTED.  The input buffer and callback context
- * are only accessed during this call.
+ * be non-zero.  Payloads larger than the inline capacity negotiated with the
+ * peer are moved to the section automatically for synchronous sends; large
+ * async sends return STATUS_NOT_SUPPORTED.  The input buffer and callback
+ * context are only accessed during this call.
  */
 NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT lpLPCClientCtx, const void *lpMsg,
                                     ULONG ulMsgLength, ULONG ControlId, uint8_t useAsyncMode,

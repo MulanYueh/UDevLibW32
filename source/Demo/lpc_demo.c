@@ -7,15 +7,18 @@
  * Native API table is resolved at runtime from ntdll.dll; no private ntdll
  * import library is required.
  *
- * Build with a Windows SDK and the LPC implementation, for example:
- *   cl /W4 /WX lpc_demo.c lpc_port.c allocator.c libc.c list.c /Fe:lpc_demo.exe
+ * From the source root, build with a Windows SDK and the LPC implementation:
+ *   cl /W4 /WX /wd4005 /I. Demo\lpc_demo.c lpc_port.c allocator.c libc.c list.c /Fe:lpc_demo.exe
  *
  * The server worker uses a one-second relative timeout.  LPC's
  * NtRequestWaitReplyPort has no timeout/cancel parameter, so only the server
  * receive loop is timed; ALPC provides an end-to-end timeout in alpc_demo.c.
  */
 #define WIN32_LEAN_AND_MEAN
+#define WIN32_NO_STATUS
 #include <windows.h>
+#undef WIN32_NO_STATUS
+#include <ntstatus.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -122,7 +125,10 @@ static int lpc_demo_resolve_client_apis(HMODULE ntdll, LPC_CLIENT_APIS *api)
                                  "NtRequestPort") &&
            lpc_demo_resolve_proc(&api->pfnNtRequestWaitReplyPort,
                                  sizeof(api->pfnNtRequestWaitReplyPort), ntdll,
-                                 "NtRequestWaitReplyPort");
+                                 "NtRequestWaitReplyPort") &&
+           lpc_demo_resolve_proc(&api->pfnNtQueryInformationProcess,
+                                 sizeof(api->pfnNtQueryInformationProcess),
+                                 ntdll, "NtQueryInformationProcess");
 }
 
 static int lpc_demo_resolve_server_apis(HMODULE ntdll, LPC_SERVER_APIS *api)
@@ -159,7 +165,10 @@ static int lpc_demo_resolve_server_apis(HMODULE ntdll, LPC_SERVER_APIS *api)
                                  "NtCompleteConnectPort") &&
            lpc_demo_resolve_proc(&api->pfnNtReplyPort,
                                  sizeof(api->pfnNtReplyPort), ntdll,
-                                 "NtReplyPort");
+                                 "NtReplyPort") &&
+           lpc_demo_resolve_proc(&api->pfnNtQueryInformationProcess,
+                                 sizeof(api->pfnNtQueryInformationProcess),
+                                 ntdll, "NtQueryInformationProcess");
 }
 
 static void lpc_demo_on_pre_connect(uint32_t *response_control_id,
@@ -234,7 +243,10 @@ static DWORD WINAPI lpc_demo_server_thread(LPVOID parameter)
     while (server && InterlockedCompareExchange(&g_lpc_demo_stop, 0, 0) == 0) {
         timeout.QuadPart = -10000000LL; /* one second, relative 100ns units */
         status = LpcPort_ProcessBlockedEventEx(server, &timeout);
-        if (status == STATUS_TIMEOUT) {
+        /* NtReplyWaitReceivePortEx can transiently report INVALID_MESSAGE
+         * when a peer closes immediately after a datagram.  The following
+         * receive still delivers LPC_TYPE_PORT_CLOSED. */
+        if (status == STATUS_TIMEOUT || status == STATUS_INVALID_MESSAGE) {
             continue;
         }
         if (status == STATUS_PORT_DISCONNECTED) {

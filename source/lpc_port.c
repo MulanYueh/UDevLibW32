@@ -524,11 +524,17 @@ static void lpc_lifetime_destroy(LPC_PORT_LIFETIME *life)
     lpc_lifetime_global_unlock();
 }
 
-static int lpc_client_api_valid(const LPC_CLIENT_APIS *api) {
+static int lpc_client_api_valid(const LPC_CLIENT_APIS *api,
+                                PSID requiredServerSid) {
     int valid = api && api->pfnRtlInitAnsiString && api->pfnNtCreateSection &&
-           api->pfnNtConnectPort && api->pfnNtClose &&
+           api->pfnNtClose &&
            api->pfnRtlAnsiStringToUnicodeString && api->pfnRtlFreeUnicodeString &&
            api->pfnNtRequestPort && api->pfnNtRequestWaitReplyPort;
+    if (requiredServerSid) {
+        valid = valid && api && api->pfnNtSecureConnectPort;
+    } else {
+        valid = valid && api && api->pfnNtConnectPort;
+    }
 #if !defined(_WIN64) && !defined(_M_AMD64) && !defined(__x86_64__) && \
     !defined(_M_ARM64) && !defined(__aarch64__) && !defined(_KERNEL_MODE)
     valid = valid && api && api->pfnNtQueryInformationProcess;
@@ -578,7 +584,7 @@ static NTSTATUS lpc_detect_64bit_wire(
             (HANDLE)(ULONG_PTR)(SIZE_T)-1,
             (ULONG)LPC_PROCESS_WOW64_INFORMATION,
             &wow64Peb, (ULONG)sizeof(wow64Peb), NULL);
-        if (!NT_SUCCESS(status)) {
+        if (status != STATUS_SUCCESS) {
             return status;
         }
         *use64BitWire = wow64Peb != 0U ? 1U : 0U;
@@ -944,9 +950,8 @@ static PLPC_SERVER_CLIENT_INFO lpc_detach_client(PLPC_SERVER_CONTEXT context, HA
                     --context->clientCount;
                 }
                 lpc_lock_release(&context->lockWord);
-                /* The caller must wake the Native receive before beginning
-                 * rundown.  Waiting here would deadlock if another worker
-                 * is blocked in NtReplyWaitReceivePort on this endpoint. */
+                /* Receives wait on the server connection port, so the caller
+                 * may drain this endpoint before closing its reply handle. */
                 return current;
             }
             break;
@@ -956,6 +961,9 @@ static PLPC_SERVER_CLIENT_INFO lpc_detach_client(PLPC_SERVER_CONTEXT context, HA
     return NULL;
 }
 
+/* On success the caller owns one client lifetime pin.  Publishing the record
+ * with that pin held keeps explicit disconnect from freeing it before the
+ * connection callback and NtCompleteConnectPort sequence finishes. */
 static int lpc_add_client(PLPC_SERVER_CONTEXT context, PLPC_SERVER_CLIENT_INFO info) {
     PLPC_SERVER_CLIENT_INFO current = NULL;
 
@@ -995,6 +1003,13 @@ static int lpc_add_client(PLPC_SERVER_CONTEXT context, PLPC_SERVER_CLIENT_INFO i
         lpc_lifetime_destroy(&info->lifetime);
         return 0;
     }
+    if (!lpc_lifetime_acquire(&info->lifetime)) {
+        (void)List_Remove(&context->clientList, &info->listEntry);
+        lpc_lock_release(&context->lockWord);
+        lpc_lock_destroy(&info->receiveLock);
+        lpc_lifetime_destroy(&info->lifetime);
+        return 0;
+    }
     ++context->clientCount;
     lpc_lock_release(&context->lockWord);
     return 1;
@@ -1027,30 +1042,26 @@ static void lpc_close_client_info(PLPC_SERVER_CLIENT_INFO info) {
  * explicit disconnect observe the missing entry and skip a duplicate close
  * notification.  The caller must hold a server lifetime pin while using this
  * helper; the per-client rundown is drained before its storage is released. */
-static NTSTATUS lpc_drop_client(PLPC_SERVER_CONTEXT context,
-                                HANDLE clientHandle,
-                                uint8_t notify)
+static NTSTATUS lpc_dispose_detached_client(PLPC_SERVER_CONTEXT context,
+                                            PLPC_SERVER_CLIENT_INFO client,
+                                            uint8_t notify)
 {
-    PLPC_SERVER_CLIENT_INFO client = NULL;
     LPC_SERVER_EVT_CONTEXT events = LPC_PORT_ZERO_INIT;
+    HANDLE clientHandle = NULL;
 
-    if (!context || !clientHandle) {
+    if (!context || !client) {
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
     }
-    client = lpc_detach_client(context, clientHandle);
-    if (!client) {
-        return LPC_STATUS(STATUS_INVALID_PARAMETER);
-    }
-    lpc_snapshot_events(context, &events);
+    clientHandle = client->hLPCPortClientHandle;
     lpc_lifetime_mark_closing(&client->lifetime);
+    /* All receives use the server connection port; the communication handle
+     * is used only to reply.  Drain workers before closing it so an in-flight
+     * NtReplyPort cannot race HANDLE reuse and target an unrelated object. */
+    lpc_lifetime_wait(&client->lifetime);
     if (context->api.pfnNtClose && client->hLPCPortClientHandle) {
         (void)context->api.pfnNtClose(client->hLPCPortClientHandle);
     }
-    /* Closing wakes a receive blocked in the Native API.  Drain every worker
-     * before publishing the close notification.  A worker takes its lifetime
-     * pin before receiveLock, so waiting for rundown while holding that lock
-     * would deadlock a worker that has already been admitted. */
-    lpc_lifetime_wait(&client->lifetime);
+    lpc_snapshot_events(context, &events);
     /* No request callback can run after rundown completes.  The callback gets
      * the saved endpoint value for identification; LPC has no disconnect
      * primitive, so the native handle is already closed at this point. */
@@ -1059,6 +1070,56 @@ static NTSTATUS lpc_drop_client(PLPC_SERVER_CONTEXT context,
     }
     lpc_close_client_info(client);
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS lpc_drop_client(PLPC_SERVER_CONTEXT context,
+                                HANDLE clientHandle,
+                                uint8_t notify)
+{
+    PLPC_SERVER_CLIENT_INFO client = NULL;
+
+    if (!context || !clientHandle) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    client = lpc_detach_client(context, clientHandle);
+    if (!client) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    return lpc_dispose_detached_client(context, client, notify);
+}
+
+/* Remove an endpoint for which the caller already owns one lifetime pin.
+ * Matching the intrusive record instead of its HANDLE closes the ABA window
+ * where a concurrent explicit disconnect can close the old handle and a new
+ * connection can receive the same numeric value before PORT_CLOSED cleanup
+ * runs.  This helper always consumes the caller's pin. */
+static NTSTATUS lpc_drop_acquired_client(PLPC_SERVER_CONTEXT context,
+                                         PLPC_SERVER_CLIENT_INFO client,
+                                         uint8_t notify)
+{
+    uint8_t detached = 0U;
+
+    if (!context || !client) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    lpc_lock_acquire(&context->lockWord);
+    if (List_Contains(&context->clientList, &client->listEntry) &&
+        List_Remove(&context->clientList, &client->listEntry)) {
+        if (context->clientCount) {
+            --context->clientCount;
+        }
+        detached = 1U;
+    }
+    lpc_lock_release(&context->lockWord);
+
+    /* The detached record is now owned by this thread.  When another thread
+     * won the detach race, dropping this pin lets that owner finish rundown;
+     * neither path may touch the record afterwards. */
+    lpc_lifetime_release(&client->lifetime);
+    if (!detached) {
+        return LPC_STATUS(STATUS_INVALID_PARAMETER);
+    }
+    return lpc_dispose_detached_client(context, client, notify);
 }
 
 static void *lpc_alloc_memory(size_t size)
@@ -1135,7 +1196,7 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
     status = lpc_detect_64bit_wire(
         context->api.pfnNtQueryInformationProcess,
         &context->use64BitWire);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         lpc_reset_server_context(context);
         return status;
     }
@@ -1155,7 +1216,7 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
 
     context->api.pfnRtlInitAnsiString(&ansiName, config->LpcName.name);
     status = context->api.pfnRtlAnsiStringToUnicodeString(&unicodeName, &ansiName, (BOOLEAN)1);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         lpc_lock_destroy(&context->lockWord);
         lpc_lifetime_destroy(&context->lifetime);
         lpc_reset_server_context(context);
@@ -1171,14 +1232,17 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG config, PLPC_SERVER_CONTEXT con
     objectAttributes.Attributes = OBJ_CASE_INSENSITIVE;
     objectAttributes.ObjectName = &context->ustrLPCName;
 #endif
+#if defined(_KERNEL_MODE)
+    objectAttributes.Attributes |= OBJ_KERNEL_HANDLE;
+#endif
 
     objectAttributes.SecurityDescriptor = config->securityDescriptor;
 
     status = context->api.pfnNtCreatePort(&context->hLPCPortServerHandle, &objectAttributes,
                                           (ULONG)sizeof(uint32_t),
                                           (ULONG)LPC_PORT_NATIVE_MAX_MESSAGE_LENGTH, 0);
-    if (!NT_SUCCESS(status) || !context->hLPCPortServerHandle) {
-        if (NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS || !context->hLPCPortServerHandle) {
+        if (status == STATUS_SUCCESS) {
             status = STATUS_DATA_ERROR;
         }
         if (context->hLPCPortServerHandle && context->api.pfnNtClose) {
@@ -1199,6 +1263,7 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     ANSI_STRING ansiName = LPC_PORT_ZERO_INIT;
     UNICODE_STRING unicodeName = LPC_PORT_ZERO_INIT;
     LARGE_INTEGER sectionSize = LPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES sectionObjectAttributes = LPC_PORT_ZERO_INIT;
     SECURITY_QUALITY_OF_SERVICE securityQos = LPC_PORT_ZERO_INIT;
     ULONG controlId = 0;
     ULONG controlIdLength = 0;
@@ -1217,14 +1282,14 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     }
     lpc_reset_client_context(context);
     context->api = config->api;
-    if (!lpc_client_api_valid(&context->api)) {
+    if (!lpc_client_api_valid(&context->api, config->requiredServerSid)) {
         lpc_reset_client_context(context);
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
     }
     status = lpc_detect_64bit_wire(
         context->api.pfnNtQueryInformationProcess,
         &context->use64BitWire);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         lpc_reset_client_context(context);
         return status;
     }
@@ -1244,7 +1309,7 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
 
     context->api.pfnRtlInitAnsiString(&ansiName, config->LpcName.name);
     status = context->api.pfnRtlAnsiStringToUnicodeString(&unicodeName, &ansiName, (BOOLEAN)1);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         lpc_lock_destroy(&context->sendLock);
         lpc_lifetime_destroy(&context->lifetime);
         lpc_reset_client_context(context);
@@ -1253,11 +1318,16 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
     context->ustrLPCName = unicodeName;
 
     sectionSize.QuadPart = (int64_t)LPC_SECTION_MAX_SPACE_SIZE;
+    sectionObjectAttributes.Length = (ULONG)sizeof(sectionObjectAttributes);
+#if defined(_KERNEL_MODE)
+    sectionObjectAttributes.Attributes = OBJ_KERNEL_HANDLE;
+#endif
     status = context->api.pfnNtCreateSection(&context->hSectionHandle,
-                                             (ACCESS_MASK)(SECTION_MAP_READ | SECTION_MAP_WRITE), NULL,
+                                             (ACCESS_MASK)(SECTION_MAP_READ | SECTION_MAP_WRITE),
+                                             &sectionObjectAttributes,
                                              &sectionSize, PAGE_READWRITE, SEC_COMMIT, NULL);
-    if (!NT_SUCCESS(status) || !context->hSectionHandle) {
-        if (NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS || !context->hSectionHandle) {
+        if (status == STATUS_SUCCESS) {
             status = STATUS_DATA_ERROR;
         }
         goto failure;
@@ -1288,11 +1358,19 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG config, PLPC_CLIENT_CONTEXT context)
 
     controlId = config->HelloId;
     controlIdLength = (ULONG)sizeof(controlId);
-    status = context->api.pfnNtConnectPort(&context->hLPCPortHandle, &context->ustrLPCName,
-                                           &securityQos, nativeClientView, NULL,
-                                           &maxMessageLength, &controlId, &controlIdLength);
-    if (!NT_SUCCESS(status) || !context->hLPCPortHandle) {
-        if (NT_SUCCESS(status)) {
+    if (config->requiredServerSid) {
+        status = context->api.pfnNtSecureConnectPort(
+            &context->hLPCPortHandle, &context->ustrLPCName, &securityQos,
+            nativeClientView, config->requiredServerSid, NULL,
+            &maxMessageLength, &controlId, &controlIdLength);
+    } else {
+        status = context->api.pfnNtConnectPort(
+            &context->hLPCPortHandle, &context->ustrLPCName, &securityQos,
+            nativeClientView, NULL, &maxMessageLength, &controlId,
+            &controlIdLength);
+    }
+    if (status != STATUS_SUCCESS || !context->hLPCPortHandle) {
+        if (status == STATUS_SUCCESS) {
             status = STATUS_DATA_ERROR;
         }
         goto failure;
@@ -1449,11 +1527,12 @@ NTSTATUS LpcPort_ServerDisconnectClient(PLPC_SERVER_CONTEXT context,
 {
     NTSTATUS status = LPC_STATUS(STATUS_INVALID_PARAMETER);
 
-    if (!context || lpc_state_load(&context->initialized) == 0 || !clientHandle ||
+    if (!context || !clientHandle ||
+        lpc_state_load(&context->initialized) == 0 ||
         !lpc_lifetime_acquire(&context->lifetime)) {
         return LPC_STATUS(STATUS_INVALID_PARAMETER);
     }
-    status = lpc_drop_client(context, clientHandle, 1);
+    status = lpc_drop_client(context, clientHandle, 1U);
     lpc_lifetime_release(&context->lifetime);
     return status;
 }
@@ -1472,6 +1551,7 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
     size_t totalLength = 0;
     size_t dataOffset = 0;
     size_t inlineCapacity = 0;
+    SIZE_T sharedWipeLength = 0U;
     ULONG replyOptions = 0U;
     uint8_t actualAsync = 0;
     uint8_t actualShared = 0;
@@ -1492,6 +1572,14 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         return STATUS_DEVICE_BUSY;
     }
     lpc_lock_acquire(&context->sendLock);
+    /* Disconnect closes the port before waiting for admitted senders.  A
+     * sender that queued behind sendLock must not issue a request with that
+     * stale (and potentially reused) handle value. */
+    if (lpc_state_load(&context->initialized) == 0 ||
+        !context->hLPCPortHandle) {
+        status = STATUS_PORT_DISCONNECTED;
+        goto done;
+    }
     if (useAsyncMode && useSharedMemory) {
         status = STATUS_NOT_SUPPORTED;
         goto done;
@@ -1521,6 +1609,7 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
         }
         sharedMemory = (PLPC_SHARED_MEMORY)context->client_view.ViewBase;
         sharedMemory->size = messageLength;
+        sharedWipeLength = (SIZE_T)sizeof(ULONG) + (SIZE_T)messageLength;
         if (messageLength) {
             libc_memcpy(sharedMemory->msg, message, messageLength);
         }
@@ -1571,7 +1660,14 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
      * that only need the transport status must not accept a malformed reply;
      * otherwise a peer can silently desynchronize the next section-backed
      * transaction. */
-    if (!NT_SUCCESS(status) || actualAsync) {
+    if (status != STATUS_SUCCESS || actualAsync) {
+        goto done;
+    }
+
+    if (!lpc_port_message_valid(replyBuffer, context->use64BitWire,
+                                sizeof(replyStorage), dataOffset) ||
+        lpc_wire_control_id(replyBuffer, context->use64BitWire) != controlId) {
+        status = STATUS_DATA_ERROR;
         goto done;
     }
 
@@ -1579,9 +1675,7 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
     if (actualShared) {
         uint32_t replyLength = 0;
         uint8_t *replyData = NULL;
-        if (!lpc_port_message_valid(replyBuffer, context->use64BitWire,
-                                    sizeof(replyStorage), dataOffset) ||
-            lpc_wire_message_type(replyBuffer, context->use64BitWire) !=
+        if (lpc_wire_message_type(replyBuffer, context->use64BitWire) !=
                 (USHORT)LPC_TYPE_REPLY ||
             (replyOptions & LPC_WIRE_OPTION_SHARED_MEMORY) == 0U ||
             (replyOptions & (LPC_WIRE_OPTION_ASYNC |
@@ -1592,6 +1686,9 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
             goto done;
         }
         callbackLength = replyLength;
+        if ((SIZE_T)sizeof(ULONG) + (SIZE_T)replyLength > sharedWipeLength) {
+            sharedWipeLength = (SIZE_T)sizeof(ULONG) + (SIZE_T)replyLength;
+        }
         if (callbackLength && replyCallback) {
             sharedReplyCopy = lpc_alloc_memory(callbackLength);
             if (!sharedReplyCopy) {
@@ -1628,13 +1725,26 @@ NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT context, const void *message,
 
 done:
     lpc_lock_release(&context->sendLock);
-    lpc_lifetime_release(&context->lifetime);
-    if (NT_SUCCESS(status) && sharedReplyCopy && replyCallback) {
+    if (status == STATUS_SUCCESS && sharedReplyCopy && replyCallback) {
         replyCallback(sharedReplyCopy, callbackLength, callbackContext);
-    } else if (NT_SUCCESS(status) && replyCallback && callbackLength == 0) {
+    } else if (status == STATUS_SUCCESS && replyCallback && callbackLength == 0) {
         replyCallback(NULL, 0, callbackContext);
     }
+    if (actualShared && context->client_view.ViewBase &&
+        sharedWipeLength != 0U && sharedWipeLength <= viewSize) {
+        (void)libc_memset_s(context->client_view.ViewBase, (size_t)viewSize, 0,
+                            (size_t)sharedWipeLength);
+    }
+    if (sharedReplyCopy && callbackLength != 0U) {
+        (void)libc_memset_s(sharedReplyCopy, (size_t)callbackLength, 0,
+                            (size_t)callbackLength);
+    }
     lpc_free_memory(sharedReplyCopy);
+    (void)libc_memset_s(requestBuffer, sizeof(requestStorage), 0,
+                        sizeof(requestStorage));
+    (void)libc_memset_s(replyBuffer, sizeof(replyStorage), 0,
+                        sizeof(replyStorage));
+    lpc_lifetime_release(&context->lifetime);
     return status;
 }
 
@@ -1680,6 +1790,14 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
     if (!lpc_lifetime_acquire(&context->lifetime)) {
         return STATUS_DEVICE_BUSY;
     }
+    /* ServerClose publishes the closing state before closing the receive
+     * handle.  Recheck after admission so a worker queued in that window does
+     * not enter Native LPC with the stale numeric handle. */
+    if (lpc_state_load(&context->initialized) == 0 ||
+        !context->hLPCPortServerHandle) {
+        lpc_lifetime_release(&context->lifetime);
+        return STATUS_PORT_DISCONNECTED;
+    }
     if (timeout && !context->api.pfnNtReplyWaitReceivePortEx) {
         result = STATUS_NOT_SUPPORTED;
         goto done;
@@ -1705,7 +1823,7 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             context->hLPCPortServerHandle, &portContext, NULL,
             lpc_wire_native_message(received));
     }
-    if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         result = status;
         goto done;
     }
@@ -1814,7 +1932,7 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             &clientHandle, pending ? pending->portContextToken : NULL,
             lpc_wire_native_message(received), (BOOLEAN)!deny,
             NULL, deny ? NULL : nativeRemoteView);
-        if (!NT_SUCCESS(status)) {
+        if (status != STATUS_SUCCESS) {
             if (pending) {
                 lpc_close_client_info(pending);
             }
@@ -1854,15 +1972,6 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             remoteView.ViewSize = (SIZE_T)remoteView64.ViewSize;
             remoteView.ViewBase = (PVOID)(ULONG_PTR)remoteView64.ViewBase;
         }
-        status = context->api.pfnNtCompleteConnectPort(clientHandle);
-        if (!NT_SUCCESS(status)) {
-            context->api.pfnNtClose(clientHandle);
-            if (pending) {
-                lpc_close_client_info(pending);
-            }
-            result = status;
-            goto done;
-        }
         /* The accepted connection must have a record that owns the token.
          * Keep this guard even though the allocation path above normally
          * proves it non-NULL; it protects future changes and malformed test
@@ -1885,9 +1994,33 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             result = STATUS_DEVICE_BUSY;
             goto done;
         }
+        /* Publish and initialize application state before completion releases
+         * the client from NtConnectPort.  This prevents another server worker
+         * from observing the first request before onPostConnect has run. */
         if (events.onPostConnect) {
             events.onPostConnect(clientHandle, responseControlId);
         }
+        status = context->api.pfnNtCompleteConnectPort(clientHandle);
+        if (status != STATUS_SUCCESS) {
+            PLPC_SERVER_CLIENT_INFO detached = lpc_detach_client(
+                context, clientHandle);
+            /* Drop the publication pin returned by lpc_add_client before
+             * draining any unexpected concurrent lookup. */
+            lpc_lifetime_release(&clientInfo->lifetime);
+            if (detached == clientInfo) {
+                /* onPostConnect has already published this endpoint to the
+                 * application.  Balance that notification even when Native
+                 * completion fails, otherwise an upper-layer route can keep
+                 * a permanently stale client entry. */
+                (void)lpc_dispose_detached_client(context, clientInfo, 1U);
+            }
+            /* If another thread already detached the record, that thread owns
+             * the final wait/close/free after this publication pin is dropped. */
+            clientInfo = NULL;
+            result = status;
+            goto done;
+        }
+        lpc_lifetime_release(&clientInfo->lifetime);
         result = STATUS_SUCCESS;
         goto done;
     }
@@ -1907,6 +2040,19 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
     lpc_lock_acquire(&clientInfo->receiveLock);
     clientLockHeld = 1;
     lpc_snapshot_events(context, &events);
+
+    /* Native LPC close notifications contain only PORT_MESSAGE.  Handle them
+     * before requiring the SDK envelope, otherwise the header-only frame is
+     * misclassified as a truncated request and the endpoint remains leaked. */
+    if (messageType == (USHORT)LPC_TYPE_PORT_CLOSED) {
+        lpc_lock_release(&clientInfo->receiveLock);
+        clientLockHeld = 0;
+        clientHeld = 0;
+        (void)lpc_drop_acquired_client(context, clientInfo, 1U);
+        clientInfo = NULL;
+        result = STATUS_SUCCESS;
+        goto done;
+    }
 
     /* A request with a truncated envelope is still attributable to this
      * client through PortContext.  Return an empty reply before reporting the
@@ -1990,8 +2136,9 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
                                          received, context->use64BitWire),
                                      callbackData, callbackLength,
                                      (options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U
-                                         ? (uint64_t)clientInfo->client_view.ViewSize
-                                         : (uint64_t)inlineCapacity);
+                                          ? (uint64_t)(clientInfo->client_view.ViewSize -
+                                                       sizeof(ULONG))
+                                          : (uint64_t)inlineCapacity);
                 if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U &&
                     callbackLength) {
                     libc_memcpy(sharedData, callbackData, callbackLength);
@@ -1999,6 +2146,8 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             }
             if ((options & LPC_WIRE_OPTION_SHARED_MEMORY) != 0U && callbackData &&
                 callbackData != sharedData) {
+                (void)libc_memset_s(callbackData, (size_t)callbackLength, 0,
+                                    (size_t)callbackLength);
                 lpc_free_memory(callbackData);
             }
             if (!validPayload) {
@@ -2049,18 +2198,6 @@ NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT context,
             break;
         }
 
-        case LPC_TYPE_PORT_CLOSED:
-            /* Defer detach/notification until the common epilogue.  The
-             * current record pin must be released first; lpc_drop_client
-             * drains the remaining pins and therefore cannot wait on itself. */
-            lpc_lock_release(&clientInfo->receiveLock);
-            clientLockHeld = 0;
-            lpc_lifetime_release(&clientInfo->lifetime);
-            clientHeld = 0;
-            (void)lpc_drop_client(context, clientHandle, 1);
-            result = STATUS_SUCCESS;
-            break;
-
         default:
             /* A synchronous peer can otherwise remain blocked forever when a
              * new/unknown type reaches an older server.  Datagram-style
@@ -2087,6 +2224,8 @@ done:
     if (clientHeld && clientInfo) {
         lpc_lifetime_release(&clientInfo->lifetime);
     }
+    (void)libc_memset_s(&receiveStorage, sizeof(receiveStorage), 0,
+                        sizeof(receiveStorage));
     lpc_lifetime_release(&context->lifetime);
     return result;
 }

@@ -4,7 +4,10 @@
  * The original version of this header depended on a private include tree and
  * exposed its private list/allocator implementation.  This version keeps the
  * transport ABI small and self-contained.  The LPC wire structures are kept
- * at their native alignment; only the payload is application-defined.
+ * at their native alignment; only the payload is application-defined.  Kernel
+ * compilation support does not imply that every classic LPC server entry point
+ * is an available, documented third-party-driver DDI; a shipping driver must
+ * validate its provider and Windows/HLK support matrix separately.
  */
 #ifndef LPC_PORT_H_INCLUDED
 #define LPC_PORT_H_INCLUDED
@@ -112,11 +115,18 @@ typedef struct _LPC_SECURITY_QUALITY_OF_SERVICE {
 typedef PVOID PSECURITY_DESCRIPTOR;
 typedef LONG NTSTATUS;
 #  endif /* LPC_ALPC_PORT_COMMON_TYPES_DEFINED */
+#  ifndef LPC_ALPC_PORT_PSID_DEFINED
+#    define LPC_ALPC_PORT_PSID_DEFINED 1
+typedef PVOID PSID;
+#  endif
 #  ifndef NTAPI
 #    define NTAPI
 #  endif
 #  ifndef OBJ_CASE_INSENSITIVE
 #    define OBJ_CASE_INSENSITIVE 0x00000040UL
+#  endif
+#  ifndef OBJ_KERNEL_HANDLE
+#    define OBJ_KERNEL_HANDLE 0x00000200UL
 #  endif
 #  ifndef SECTION_MAP_READ
 #    define SECTION_MAP_READ 0x0004UL
@@ -135,6 +145,19 @@ typedef LONG NTSTATUS;
 #  endif
 #  ifndef SECURITY_DYNAMIC_TRACKING
 #    define SECURITY_DYNAMIC_TRACKING 1
+#  endif
+#endif
+
+/* Every public LpcPort API and application callback is a PASSIVE_LEVEL-only
+ * contract in kernel mode.  Native LPC waits, pageable caller buffers,
+ * allocator activity, push locks, and rundown draining are not safe at APC or
+ * dispatch level.  The annotation is intentionally empty for user-mode and
+ * freestanding builds so the same header remains portable C/C++. */
+#ifndef LPC_PORT_IRQL_PASSIVE
+#  if defined(_KERNEL_MODE) && LPC_PORT_HAS_PLATFORM_HEADERS
+#    define LPC_PORT_IRQL_PASSIVE _IRQL_requires_(PASSIVE_LEVEL)
+#  else
+#    define LPC_PORT_IRQL_PASSIVE
 #  endif
 #endif
 
@@ -375,8 +398,11 @@ typedef struct _LPC_HEADER64 {
  * Receives a synchronous reply on the client thread that called
  * LpcPort_SendMessage.  `buffer` is valid only while the callback runs.
  * The callback's NTSTATUS return value is reserved and is not used to alter
- * the status returned by LpcPort_SendMessage.
+ * the status returned by LpcPort_SendMessage.  The client lifetime remains
+ * pinned through the callback, so the callback must not disconnect this same
+ * context; signal another thread when shutdown is required.
  */
+LPC_PORT_IRQL_PASSIVE
 typedef NTSTATUS (NTAPI *typedef_LpcSyncMsgReplyCallback)(PVOID buffer, ULONG len, PVOID lpCtx);
 
 /**
@@ -387,13 +413,16 @@ typedef NTSTATUS (NTAPI *typedef_LpcSyncMsgReplyCallback)(PVOID buffer, ULONG le
  * accept the connection.  The callback runs on the thread that calls a
  * LpcPort_ProcessBlockedEvent* function and must not retain either pointer.
  */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnPreConnect)(uint32_t *lpRespCtrlId, uint8_t *bDeny);
 
 /** Invoked after a connection has been accepted and added to the client list.
  * The handle remains owned by the server until ServerDisconnectClient or
  * ServerClose; do not close it directly from the callback.  Do not call
- * ServerClose from any callback while an event-processing call is in flight.
+ * ServerClose or ServerDisconnectClient from this callback while an
+ * event-processing call is in flight.
  */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnPostConnect)(HANDLE hClientHandle, uint32_t ulCtrlId);
 
 /**
@@ -404,6 +433,7 @@ typedef void (*pfnLPCEvtOnPostConnect)(HANDLE hClientHandle, uint32_t ulCtrlId);
  * lock.  Do not call back into the same server, ServerClose, or
  * ServerDisconnectClient while handling this event.
  */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnSyncRequest)(HANDLE hClientHandle, uint32_t ulCtrlId,
                                        uint8_t *msg, uint32_t size, uint64_t maxSize);
 
@@ -411,6 +441,7 @@ typedef void (*pfnLPCEvtOnSyncRequest)(HANDLE hClientHandle, uint32_t ulCtrlId,
  * Invoked for an asynchronous datagram.  The payload pointer is temporary and
  * no reply is sent.  Copy the data if it must outlive the callback.
  */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnAsyncRequest)(HANDLE hClientHandle, uint32_t ulCtrlId,
                                          uint8_t *msg, uint32_t size, uint64_t maxSize);
 
@@ -421,10 +452,12 @@ typedef void (*pfnLPCEvtOnAsyncRequest)(HANDLE hClientHandle, uint32_t ulCtrlId,
  * this callback, so treat the handle as an identifier and do not use it.  Do
  * not call LpcPort_ServerClose or LpcPort_ServerDisconnectClient recursively
  * from this callback. */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnClose)(HANDLE hClientHandle);
 
 /* Retained for source compatibility.  The current status-returning APIs do
  * not invoke this callback; inspect their NTSTATUS return value instead. */
+LPC_PORT_IRQL_PASSIVE
 typedef void (*pfnLPCEvtOnError)(uint32_t line, NTSTATUS status);
 
 /**
@@ -473,6 +506,12 @@ typedef NTSTATUS (NTAPI *typedef_NtConnectPort)(PHANDLE PortHandle, PUNICODE_STR
                                                  PLPC_PORT_VIEW ClientView, PLPC_REMOTE_PORT_VIEW ServerView,
                                                  PULONG MaxMessageLength, PVOID ConnectionInformation,
                                                  PULONG ConnectionInformationLength);
+typedef NTSTATUS (NTAPI *typedef_NtSecureConnectPort)(
+    PHANDLE PortHandle, PUNICODE_STRING PortName,
+    PSECURITY_QUALITY_OF_SERVICE SecurityQos, PLPC_PORT_VIEW ClientView,
+    PSID RequiredServerSid, PLPC_REMOTE_PORT_VIEW ServerView,
+    PULONG MaxMessageLength, PVOID ConnectionInformation,
+    PULONG ConnectionInformationLength);
 typedef NTSTATUS (NTAPI *typedef_NtClose)(HANDLE Handle);
 typedef NTSTATUS (NTAPI *typedef_RtlAnsiStringToUnicodeString)(PUNICODE_STRING DestinationString,
                                                                 PANSI_STRING SourceString,
@@ -487,11 +526,16 @@ typedef NTSTATUS (NTAPI *typedef_NtQueryInformationProcess)(
     PVOID ProcessInformation, ULONG ProcessInformationLength,
     PULONG ReturnLength);
 
-/** Client-side Native API table.  All members are required. */
+/**
+ * Client-side Native API table.  The common members are required.
+ * pfnNtConnectPort is required when requiredServerSid is NULL;
+ * pfnNtSecureConnectPort is required when requiredServerSid is non-NULL.
+ */
 typedef struct _LPC_CLIENT_APIS {
     typedef_RtlInitAnsiString pfnRtlInitAnsiString; /* Required string initializer. */
     typedef_NtCreateSection pfnNtCreateSection; /* Required for the client section. */
-    typedef_NtConnectPort pfnNtConnectPort; /* Required connection call. */
+    typedef_NtConnectPort pfnNtConnectPort; /* Used without a server SID policy. */
+    typedef_NtSecureConnectPort pfnNtSecureConnectPort; /* Used with requiredServerSid. */
     typedef_NtClose pfnNtClose; /* Required handle cleanup. */
     typedef_RtlAnsiStringToUnicodeString pfnRtlAnsiStringToUnicodeString;
     typedef_RtlFreeUnicodeString pfnRtlFreeUnicodeString;
@@ -509,12 +553,15 @@ typedef struct _LPC_CLIENT_APIS {
 /**
  * Client creation settings.  Zero-initialize before filling the port name,
  * HelloId and resolved API table.  lpRespID is optional and receives the
- * server's response control ID on a successful connection.
+ * server's response control ID on a successful connection.  Set
+ * requiredServerSid to require Native LPC to authenticate the server SID;
+ * the SID only needs to remain valid until LpcPort_Connect returns.
  */
 typedef struct _LPC_CLIENT_CONFIG {
     uint32_t HelloId;
     LPC_PORT_NAME LpcName;
     uint32_t *lpRespID;
+    PSID requiredServerSid;
     LPC_CLIENT_APIS api;
 } LPC_CLIENT_CONFIG, *PLPC_CLIENT_CONFIG;
 
@@ -668,6 +715,7 @@ extern "C" {
  * functions.  Returns STATUS_DEVICE_BUSY for an already initialized context
  * and propagates Native API failures otherwise.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG lpServerCfg, PLPC_SERVER_CONTEXT lpLPCServerCtx);
 
 /**
@@ -677,13 +725,15 @@ NTSTATUS LpcPort_ServerCreate(PLPC_SERVER_CONFIG lpServerCfg, PLPC_SERVER_CONTEX
  * invoke it recursively from an event callback; signal an external shutdown
  * flag and let the owner thread perform the close.
  */
+LPC_PORT_IRQL_PASSIVE
 void LpcPort_ServerClose(PLPC_SERVER_CONTEXT lpLPCServerCtx);
 
 /**
  * Creates a client section and connects it to the named server port.
  *
  * Zero-initialize both the config and context, fill the same `LpcName` used by
- * the server, and provide every entry in `lpClientCfg->api`.  On success the
+ * the server, and provide every common API entry plus the connection entry
+ * selected by `requiredServerSid`.  On success the
  * context owns the port/section handles and must eventually be passed to
  * LpcPort_Disconnect (the historical LpcPort_DisConnect spelling is kept as
  * a compatibility wrapper).  `lpRespID` is optional and receives the negotiated
@@ -691,6 +741,7 @@ void LpcPort_ServerClose(PLPC_SERVER_CONTEXT lpLPCServerCtx);
  * can wake an already in-flight send, but no caller may start another API call
  * after disconnect begins.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG lpClientCfg, PLPC_CLIENT_CONTEXT lpLPCClientCtx);
 
 /**
@@ -703,17 +754,22 @@ NTSTATUS LpcPort_Connect(PLPC_CLIENT_CONFIG lpClientCfg, PLPC_CLIENT_CONTEXT lpL
  * be non-zero.  Payloads larger than the inline capacity negotiated with the
  * peer are moved to the section automatically for synchronous sends; large
  * async sends return STATUS_NOT_SUPPORTED.  The input buffer and callback
- * context are only accessed during this call.
+ * context are only accessed during this call.  The reply callback runs after
+ * the send lock is released but while the client lifetime is pinned; it must
+ * not disconnect this same context.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_SendMessage(PLPC_CLIENT_CONTEXT lpLPCClientCtx, const void *lpMsg,
                                     ULONG ulMsgLength, ULONG ControlId, uint8_t useAsyncMode,
                                     uint8_t useSharedMemory,
                                     typedef_LpcSyncMsgReplyCallback pfnSyncReplyCallback, void *lpCtx);
 
 /** Closes a client port and section and releases the allocated port name. */
+LPC_PORT_IRQL_PASSIVE
 void LpcPort_DisConnect(PLPC_CLIENT_CONTEXT lpLPCClientCtx);
 
 /** Preferred spelling of LpcPort_DisConnect; provided for new integrations. */
+LPC_PORT_IRQL_PASSIVE
 void LpcPort_Disconnect(PLPC_CLIENT_CONTEXT lpLPCClientCtx);
 
 /**
@@ -721,6 +777,7 @@ void LpcPort_Disconnect(PLPC_CLIENT_CONTEXT lpLPCClientCtx);
  * delivered to server callbacks.  Call this after the corresponding callback
  * has returned; the SDK waits for in-flight work before freeing the endpoint.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_ServerDisconnectClient(PLPC_SERVER_CONTEXT lpLPCServerCtx,
                                          HANDLE hClientHandle);
 
@@ -732,6 +789,7 @@ NTSTATUS LpcPort_ServerDisconnectClient(PLPC_SERVER_CONTEXT lpLPCServerCtx,
  * synchronously on the event-processing thread; do not recursively process
  * the same server from a callback.
  */
+LPC_PORT_IRQL_PASSIVE
 uint8_t LpcPort_Register_ServerEvtCallback(PLPC_SERVER_CONTEXT lpLPCServerCtx,
                                                   const LPC_SERVER_EVT_CONTEXT *lpEvents);
 
@@ -743,6 +801,7 @@ uint8_t LpcPort_Register_ServerEvtCallback(PLPC_SERVER_CONTEXT lpLPCServerCtx,
  * different clients may be processed concurrently.  Returns the Native
  * reply/receive status or a transport validation status.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_ProcessBlockedEvent(PLPC_SERVER_CONTEXT lpLPCServerCtx);
 
 /**
@@ -754,6 +813,7 @@ NTSTATUS LpcPort_ProcessBlockedEvent(PLPC_SERVER_CONTEXT lpLPCServerCtx);
  * `STATUS_TIMEOUT` means no event arrived before the deadline.  A non-NULL
  * timeout requires pfnNtReplyWaitReceivePortEx in the server API table.
  */
+LPC_PORT_IRQL_PASSIVE
 NTSTATUS LpcPort_ProcessBlockedEventEx(PLPC_SERVER_CONTEXT lpLPCServerCtx,
                                              const LARGE_INTEGER *lpTimeout);
 

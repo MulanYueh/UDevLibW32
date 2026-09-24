@@ -95,6 +95,30 @@ typedef struct _ALPC_PORT_PENDING_REPLY {
     LONG state;
 } ALPC_PORT_PENDING_REPLY, *PALPC_PORT_PENDING_REPLY;
 
+/* The Native ALPC ABI is pointer-width dependent.  Fail the build instead of
+ * silently issuing syscalls with a packing change introduced by a compiler or
+ * an unexpected platform header. */
+#if defined(_WIN64) || defined(_M_AMD64) || defined(__x86_64__) || \
+    defined(__amd64__) || defined(_M_ARM64) || defined(__aarch64__)
+typedef char ALPC_PORT_MESSAGE_native_size_must_be_40[
+    sizeof(ALPC_PORT_MESSAGE) == 40U ? 1 : -1];
+typedef char ALPC_PORT_FRAME_native_data_offset_must_be_56[
+    ALPC_PORT_FRAME_DATA_OFFSET == 56U ? 1 : -1];
+typedef char ALPC_PORT_ATTRIBUTES_native_size_must_be_72[
+    sizeof(ALPC_PORT_SDK_ATTRIBUTES) == 72U ? 1 : -1];
+typedef char ALPC_PORT_CONTEXT_ATTRIBUTES_native_size_must_be_40[
+    sizeof(ALPC_PORT_CONTEXT_ATTRIBUTES) == 40U ? 1 : -1];
+#else
+typedef char ALPC_PORT_MESSAGE_native_size_must_be_24[
+    sizeof(ALPC_PORT_MESSAGE) == 24U ? 1 : -1];
+typedef char ALPC_PORT_FRAME_native_data_offset_must_be_40[
+    ALPC_PORT_FRAME_DATA_OFFSET == 40U ? 1 : -1];
+typedef char ALPC_PORT_ATTRIBUTES_native_size_must_be_44[
+    sizeof(ALPC_PORT_SDK_ATTRIBUTES) == 44U ? 1 : -1];
+typedef char ALPC_PORT_CONTEXT_ATTRIBUTES_native_size_must_be_28[
+    sizeof(ALPC_PORT_CONTEXT_ATTRIBUTES) == 28U ? 1 : -1];
+#endif
+
 /* Publish the context state atomically so concurrent Close calls cannot both
  * tear down the same native handle while workers are still entering waits. */
 static LONG alpc_state_load(const volatile LONG *state)
@@ -303,6 +327,138 @@ static void alpc_lock_release(ALPC_PORT_LOCK *lock)
     __sync_lock_release(&lock->native);
 #else
     lock->native = 0U;
+#endif
+}
+
+/* Synchronous sends need a waitable binary gate rather than the generic list
+ * lock: the caller's deadline must include time queued behind an earlier send.
+ * Auto-reset user events and kernel synchronization events both provide a
+ * one-owner signal without holding a lock across the Native ALPC wait. */
+static int alpc_wait_lock_init(ALPC_PORT_WAIT_LOCK *lock)
+{
+    if (!lock) {
+        return 0;
+    }
+#if defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+    KeInitializeEvent(&lock->native, SynchronizationEvent, (BOOLEAN)1);
+#elif !defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+    lock->native = CreateEventW(NULL, (BOOLEAN)0, (BOOLEAN)1, NULL);
+    if (!lock->native) {
+        return 0;
+    }
+#else
+    lock->native = 0;
+#endif
+    lock->initialized = 1U;
+    return 1;
+}
+
+static void alpc_wait_lock_destroy(ALPC_PORT_WAIT_LOCK *lock)
+{
+    if (!lock || !lock->initialized) {
+        return;
+    }
+#if !defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+    if (lock->native) {
+        (void)CloseHandle(lock->native);
+    }
+    lock->native = NULL;
+#elif !defined(_KERNEL_MODE) && !ALPC_PORT_HAS_PLATFORM_HEADERS
+    lock->native = 0;
+#endif
+    lock->initialized = 0U;
+}
+
+static NTSTATUS alpc_wait_lock_acquire(
+    ALPC_PORT_WAIT_LOCK *lock,
+    AlpcPort_NtQuerySystemTime querySystemTime,
+    const LARGE_INTEGER *deadline)
+{
+    LARGE_INTEGER remaining = ALPC_PORT_ZERO_INIT;
+    LARGE_INTEGER waitSlice = ALPC_PORT_ZERO_INIT;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!lock || !lock->initialized) {
+        return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
+    }
+
+    for (;;) {
+        PLARGE_INTEGER timeoutArgument = NULL;
+        if (deadline) {
+            status = AlpcPort_RemainingTimeout(querySystemTime, deadline,
+                                               &remaining);
+            if (status != STATUS_SUCCESS) {
+                return status;
+            }
+            /* Recheck an absolute deadline periodically so a system-time
+             * adjustment cannot leave a user-mode relative wait stale. */
+            waitSlice = remaining;
+            if (waitSlice.QuadPart < (LONGLONG)-1000000LL) {
+                waitSlice.QuadPart = (LONGLONG)-1000000LL; /* 100 ms */
+            }
+            timeoutArgument = &waitSlice;
+        }
+
+#if defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+        status = KeWaitForSingleObject(&lock->native, Executive, KernelMode,
+                                       (BOOLEAN)0, timeoutArgument);
+        if (status == STATUS_SUCCESS) {
+            return STATUS_SUCCESS;
+        }
+        if (status != STATUS_TIMEOUT) {
+            return status;
+        }
+#elif !defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+        {
+            DWORD waitMilliseconds = INFINITE;
+            DWORD waitResult = 0U;
+            if (timeoutArgument) {
+                uint64_t ticks = (uint64_t)(-timeoutArgument->QuadPart);
+                uint64_t milliseconds = (ticks + 9999U) / 10000U;
+                if (milliseconds == 0U) {
+                    milliseconds = 1U;
+                }
+                if (milliseconds > (uint64_t)0xfffffffeUL) {
+                    milliseconds = (uint64_t)0xfffffffeUL;
+                }
+                waitMilliseconds = (DWORD)milliseconds;
+            }
+            waitResult = WaitForSingleObject(lock->native, waitMilliseconds);
+            if (waitResult == WAIT_OBJECT_0) {
+                return STATUS_SUCCESS;
+            }
+            if (waitResult != WAIT_TIMEOUT) {
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
+#else
+        if (alpc_state_compare_exchange(&lock->native, 0, 1) == 0) {
+            return STATUS_SUCCESS;
+        }
+#  if defined(_MSC_VER)
+        YieldProcessor();
+#  endif
+#endif
+
+        if (!deadline) {
+            /* A valid infinite wait does not time out.  Only the freestanding
+             * fallback reaches this loop without a native wait primitive. */
+            continue;
+        }
+    }
+}
+
+static void alpc_wait_lock_release(ALPC_PORT_WAIT_LOCK *lock)
+{
+    if (!lock || !lock->initialized) {
+        return;
+    }
+#if defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+    (void)KeSetEvent(&lock->native, IO_NO_INCREMENT, (BOOLEAN)0);
+#elif !defined(_KERNEL_MODE) && ALPC_PORT_HAS_PLATFORM_HEADERS
+    (void)SetEvent(lock->native);
+#else
+    alpc_state_store(&lock->native, 0);
 #endif
 }
 
@@ -674,6 +830,19 @@ static void alpc_free(void *memory)
 #endif
 }
 
+/* ALPC frames may contain authentication material or application payloads.
+ * Use the volatile libc wipe before returning their backing allocation. */
+static void alpc_secure_free(void *memory, SIZE_T size)
+{
+    if (!memory) {
+        return;
+    }
+    if (size != 0U) {
+        (void)libc_memset_s(memory, (size_t)size, 0, (size_t)size);
+    }
+    alpc_free(memory);
+}
+
 static NTSTATUS alpc_query_system_time(
     AlpcPort_NtQuerySystemTime querySystemTime,
     PLARGE_INTEGER systemTime)
@@ -827,9 +996,16 @@ static SIZE_T alpc_normalize_max_message_length(SIZE_T configured)
     return configured ? configured : ALPC_PORT_DEFAULT_MAX_MESSAGE_LENGTH;
 }
 
+static SIZE_T alpc_payload_capacity(SIZE_T maxMessageLength)
+{
+    return maxMessageLength >= ALPC_PORT_CROSS_ARCH_FRAME_DATA_OFFSET
+               ? maxMessageLength - ALPC_PORT_CROSS_ARCH_FRAME_DATA_OFFSET
+               : 0U;
+}
+
 static int alpc_max_message_length_valid(SIZE_T length)
 {
-    return length >= (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET &&
+    return length >= ALPC_PORT_CROSS_ARCH_FRAME_DATA_OFFSET &&
            length <= ALPC_PORT_HARD_MAX_MESSAGE_LENGTH && length <= (SIZE_T)0xffffU;
 }
 
@@ -881,6 +1057,12 @@ static void alpc_init_object_attributes(POBJECT_ATTRIBUTES attributes,
     libc_memset(attributes, 0, sizeof(*attributes));
     attributes->Length = (ULONG)sizeof(*attributes);
     attributes->Attributes = OBJ_CASE_INSENSITIVE;
+#if defined(_KERNEL_MODE)
+    /* Drivers can run in an arbitrary process context.  Keep every handle
+     * created by this transport in the system handle table so user mode
+     * cannot close it and process exit cannot invalidate it. */
+    attributes->Attributes |= OBJ_KERNEL_HANDLE;
+#endif
     attributes->ObjectName = objectName;
     attributes->SecurityDescriptor = securityDescriptor;
 }
@@ -1011,11 +1193,10 @@ static NTSTATUS alpc_send_error_reply(const ALPC_PORT_SERVER_CONTEXT *context,
     sendStatus = context->api.pfnNtAlpcSendWaitReceivePort(
         clientPort, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE, &frame->header, NULL,
         NULL, NULL, NULL, &noWait);
-    if (replyFailed &&
-        (sendStatus == STATUS_TIMEOUT || !NT_SUCCESS(sendStatus))) {
+    if (replyFailed && sendStatus != STATUS_SUCCESS) {
         *replyFailed = 1U;
     }
-    return (sendStatus == STATUS_TIMEOUT || !NT_SUCCESS(sendStatus))
+    return sendStatus != STATUS_SUCCESS
                ? sendStatus : errorStatus;
 }
 
@@ -1030,6 +1211,7 @@ static NTSTATUS alpc_reject_connection(const ALPC_PORT_SERVER_CONTEXT *context,
                                        PALPC_PORT_FRAME frame)
 {
     ALPC_PORT_MESSAGE normalized = ALPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES objectAttributes = ALPC_PORT_ZERO_INIT;
     HANDLE rejectedPort = NULL;
     NTSTATUS status = STATUS_DATA_ERROR;
 
@@ -1045,8 +1227,10 @@ static NTSTATUS alpc_reject_connection(const ALPC_PORT_SERVER_CONTEXT *context,
     normalized.u1.s1.DataLength = 0;
     normalized.u2.s2.Type = (USHORT)ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST;
     normalized.u2.s2.DataInfoOffset = 0;
+    alpc_init_object_attributes(&objectAttributes, NULL, NULL);
     status = context->api.pfnNtAlpcAcceptConnectPort(
-        &rejectedPort, context->connectionPortHandle, 0, NULL, NULL, NULL,
+        &rejectedPort, context->connectionPortHandle, 0, &objectAttributes,
+        NULL, NULL,
         &normalized, NULL, (BOOLEAN)0);
     if (rejectedPort && context->api.pfnNtClose) {
         (void)context->api.pfnNtClose(rejectedPort);
@@ -1071,7 +1255,8 @@ static int alpc_received_frame_valid(const PALPC_PORT_FRAME frame,
         total > receivedLength || total > capacity) {
         return 0;
     }
-    return alpc_frame_valid(frame, total);
+    return alpc_frame_valid(frame, total) &&
+           (SIZE_T)frame->PayloadLength <= alpc_payload_capacity(capacity);
 }
 
 static int alpc_message_type_is(USHORT actual, ULONG expected)
@@ -1472,7 +1657,7 @@ NTSTATUS AlpcPort_ServerCreate(PALPC_PORT_SERVER_CONFIG config,
     status = alpc_build_unicode_name(context->api.pfnRtlInitAnsiString,
                                       context->api.pfnRtlAnsiStringToUnicodeString,
                                       &config->portName, &context->unicodeName);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         alpc_lock_destroy(&context->connectionReceiveLock);
         alpc_lock_destroy(&context->lockWord);
         alpc_lifetime_destroy(&context->lifetime);
@@ -1491,8 +1676,8 @@ NTSTATUS AlpcPort_ServerCreate(PALPC_PORT_SERVER_CONFIG config,
                               &securityQos);
     status = context->api.pfnNtAlpcCreatePort(&context->connectionPortHandle,
                                                &objectAttributes, &portAttributes);
-    if (!NT_SUCCESS(status) || !context->connectionPortHandle) {
-        if (NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS || !context->connectionPortHandle) {
+        if (status == STATUS_SUCCESS) {
             status = STATUS_DATA_ERROR;
         }
         if (context->connectionPortHandle && context->api.pfnNtClose) {
@@ -1756,8 +1941,7 @@ static NTSTATUS alpc_dispatch_server_frame(PALPC_PORT_SERVER_CONTEXT context,
         callbackResult = events.onSyncRequest(
             client->portHandle, &frame->header.ClientId, frame->ControlId,
             frame->data, &replyLength,
-            (ULONG)(context->maxMessageLength -
-                    (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET),
+            (ULONG)alpc_payload_capacity(context->maxMessageLength),
             events.callbackContext);
         callbackStatus = alpc_finish_sync_callback(context, client,
                                                    callbackResult);
@@ -1769,7 +1953,8 @@ static NTSTATUS alpc_dispatch_server_frame(PALPC_PORT_SERVER_CONTEXT context,
     if (callbackStatus == STATUS_PENDING) {
         return STATUS_PENDING;
     }
-    if (!alpc_set_frame_length(frame, context->maxMessageLength, replyLength)) {
+    if ((SIZE_T)replyLength > alpc_payload_capacity(context->maxMessageLength) ||
+        !alpc_set_frame_length(frame, context->maxMessageLength, replyLength)) {
         sendStatus = alpc_send_error_reply(context, client->portHandle, frame,
                                            STATUS_INFO_LENGTH_MISMATCH,
                                            transportDisconnected);
@@ -1781,10 +1966,10 @@ static NTSTATUS alpc_dispatch_server_frame(PALPC_PORT_SERVER_CONTEXT context,
     sendStatus = context->api.pfnNtAlpcSendWaitReceivePort(
         client->portHandle, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE, &frame->header,
         NULL, NULL, NULL, NULL, &noWait);
-    if (sendStatus == STATUS_TIMEOUT || !NT_SUCCESS(sendStatus)) {
+    if (sendStatus != STATUS_SUCCESS) {
         *transportDisconnected = 1U;
     }
-    return (sendStatus == STATUS_TIMEOUT || !NT_SUCCESS(sendStatus))
+    return sendStatus != STATUS_SUCCESS
                ? sendStatus : callbackStatus;
 }
 
@@ -1801,6 +1986,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     PALPC_PORT_SERVER_CLIENT routedClient = NULL;
     ALPC_PORT_CONTEXT_ATTRIBUTES messageAttributes = ALPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES acceptedObjectAttributes = ALPC_PORT_ZERO_INIT;
     uint8_t havePortContext = 0U;
     uint8_t nativeControl = 0U;
     uint8_t transportDisconnected = 0U;
@@ -1829,13 +2015,13 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
         context->connectionPortHandle, 0, NULL, NULL, &frame->header,
         &bufferLength, &messageAttributes.Header, timeoutArgument);
     alpc_lock_release(&context->connectionReceiveLock);
-    if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
-        alpc_free(frame);
+    if (status != STATUS_SUCCESS) {
+        alpc_secure_free(frame, context->maxMessageLength);
         alpc_lifetime_release(&context->lifetime);
         return status;
     }
     if (bufferLength < (SIZE_T)sizeof(ALPC_PORT_MESSAGE)) {
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         alpc_lifetime_release(&context->lifetime);
         return STATUS_DATA_ERROR;
     }
@@ -1850,7 +2036,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
         if (nativeControl &&
             !alpc_message_type_is(frame->header.u2.s2.Type,
                                   ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED)) {
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_SUCCESS;
         }
@@ -1859,7 +2045,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
              ALPC_PORT_MESSAGE_CONTEXT_ATTRIBUTE) != 0U);
         if (havePortContext) {
             if (!messageAttributes.Context.PortContext) {
-                alpc_free(frame);
+                alpc_secure_free(frame, context->maxMessageLength);
                 alpc_lifetime_release(&context->lifetime);
                 return STATUS_DATA_ERROR;
             }
@@ -1875,7 +2061,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
                 if (routedClient) {
                     alpc_lifetime_release(&routedClient->lifetime);
                 }
-                alpc_free(frame);
+                alpc_secure_free(frame, context->maxMessageLength);
                 alpc_lifetime_release(&context->lifetime);
                 return STATUS_DATA_ERROR;
             }
@@ -1890,7 +2076,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
                 context, &frame->header.ClientId);
         }
         if (!routedClient) {
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_PORT_DISCONNECTED;
         }
@@ -1904,7 +2090,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
         } else {
             alpc_lifetime_release(&routedClient->lifetime);
         }
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         alpc_lifetime_release(&context->lifetime);
         return status;
     }
@@ -1915,11 +2101,11 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
         if (alpc_message_type_is(frame->header.u2.s2.Type,
                                  ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST)) {
             status = alpc_reject_connection(context, frame);
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
-            return NT_SUCCESS(status) ? STATUS_DATA_ERROR : status;
+            return status == STATUS_SUCCESS ? STATUS_DATA_ERROR : status;
         }
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         alpc_lifetime_release(&context->lifetime);
         return STATUS_DATA_ERROR;
     }
@@ -1929,9 +2115,9 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
     if (frame->Flags != 0 || frame->Status != STATUS_SUCCESS ||
         frame->PayloadLength != 0) {
         status = alpc_reject_connection(context, frame);
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         alpc_lifetime_release(&context->lifetime);
-        return NT_SUCCESS(status) ? STATUS_DATA_ERROR : status;
+        return status == STATUS_SUCCESS ? STATUS_DATA_ERROR : status;
     }
     alpc_snapshot_events(context, &events);
     responseControlId = frame->ControlId;
@@ -1958,7 +2144,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             pending = (PALPC_PORT_SERVER_CLIENT)alpc_alloc(sizeof(*pending));
             if (!pending) {
                 (void)alpc_reject_connection(context, frame);
-                alpc_free(frame);
+                alpc_secure_free(frame, context->maxMessageLength);
                 alpc_lifetime_release(&context->lifetime);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
@@ -1967,7 +2153,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
                 !alpc_lock_init(&pending->receiveLock)) {
                 (void)alpc_reject_connection(context, frame);
                 alpc_release_client_info(pending);
-                alpc_free(frame);
+                alpc_secure_free(frame, context->maxMessageLength);
                 alpc_lifetime_release(&context->lifetime);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
@@ -1976,21 +2162,23 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             if (!NT_SUCCESS(status)) {
                 (void)alpc_reject_connection(context, frame);
                 alpc_release_client_info(pending);
-                alpc_free(frame);
+                alpc_secure_free(frame, context->maxMessageLength);
                 alpc_lifetime_release(&context->lifetime);
                 return status;
             }
         }
+        alpc_init_object_attributes(&acceptedObjectAttributes, NULL, NULL);
         status = context->api.pfnNtAlpcAcceptConnectPort(
-            &clientPort, context->connectionPortHandle, 0, NULL,
+            &clientPort, context->connectionPortHandle, 0,
+            &acceptedObjectAttributes,
             &context->portAttributes,
             pending ? pending->portContextToken : NULL,
             &frame->header, NULL, (BOOLEAN)!deny);
-        if (!NT_SUCCESS(status)) {
+        if (status != STATUS_SUCCESS) {
             if (pending) {
                 alpc_release_client_info(pending);
             }
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return status;
         }
@@ -1998,13 +2186,13 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             if (clientPort) {
                 alpc_close_client_handle(context, clientPort, 1);
             }
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_SUCCESS;
         }
         if (!clientPort) {
             alpc_release_client_info(pending);
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_DATA_ERROR;
         }
@@ -2019,7 +2207,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
          * kernel/user-mode crash. */
         if (pending == (PALPC_PORT_SERVER_CLIENT)0) {
             alpc_close_client_handle(context, clientPort, 1);
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -2031,7 +2219,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
             /* alpc_add_client destroys initialized synchronization fields on
              * failure, so only release the allocation here. */
             alpc_free(pending);
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             alpc_lifetime_release(&context->lifetime);
             return STATUS_DEVICE_BUSY;
         }
@@ -2041,7 +2229,7 @@ NTSTATUS AlpcPort_ProcessBlockedEventEx(PALPC_PORT_SERVER_CONTEXT context,
         }
         alpc_lifetime_release(&pending->lifetime);
     }
-    alpc_free(frame);
+    alpc_secure_free(frame, context->maxMessageLength);
     alpc_lifetime_release(&context->lifetime);
     return STATUS_SUCCESS;
 }
@@ -2183,13 +2371,13 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         receivePort, 0, NULL, NULL, &frame->header, &bufferLength, NULL,
         timeoutArgument);
     if (status == STATUS_PORT_DISCONNECTED) {
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         dropClient = 1;
         result = status;
         goto done;
     }
-    if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
-        alpc_free(frame);
+    if (status != STATUS_SUCCESS) {
+        alpc_secure_free(frame, context->maxMessageLength);
         result = status;
         goto done;
     }
@@ -2204,7 +2392,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
                                      ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED)) {
                 dropClient = 1;
             }
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             result = STATUS_SUCCESS;
             goto done;
         }
@@ -2223,14 +2411,14 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         } else {
             result = STATUS_DATA_ERROR;
         }
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         goto done;
     }
     messageType = frame->header.u2.s2.Type;
     if (alpc_native_control_type((USHORT)messageType) &&
         alpc_message_type_is((USHORT)messageType,
                              ALPC_PORT_MESSAGE_TYPE_PORT_CLOSED)) {
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         dropClient = 1;
         result = STATUS_SUCCESS;
         goto done;
@@ -2245,7 +2433,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
          * treated the same way. */
         if (frame->Flags != ALPC_PORT_SEND_FLAG_ASYNC ||
             frame->Status != STATUS_SUCCESS) {
-            alpc_free(frame);
+            alpc_secure_free(frame, context->maxMessageLength);
             result = STATUS_DATA_ERROR;
             goto done;
         }
@@ -2256,7 +2444,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
                 replyPort, &frame->header.ClientId, frame->ControlId, frame->data,
                 frame->PayloadLength, events.callbackContext);
         }
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         result = callbackStatus;
         goto done;
     }
@@ -2267,7 +2455,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
      * made by the client. */
     if (alpc_native_control_type((USHORT)messageType) &&
         alpc_native_connection_complete_type((USHORT)messageType)) {
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         result = STATUS_SUCCESS;
         goto done;
     }
@@ -2281,13 +2469,13 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         } else {
             result = STATUS_DATA_ERROR;
         }
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         goto done;
     }
     if (frame->Flags != 0 || frame->Status != STATUS_SUCCESS) {
         result = alpc_send_error_reply(context, replyPort, frame,
                                        STATUS_DATA_ERROR, &dropClient);
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         goto done;
     }
     alpc_snapshot_events(context, &events);
@@ -2303,7 +2491,7 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         callbackResult = events.onSyncRequest(
             replyPort, &frame->header.ClientId, frame->ControlId, frame->data,
             &replyLength,
-            (ULONG)(context->maxMessageLength - (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET),
+            (ULONG)alpc_payload_capacity(context->maxMessageLength),
             events.callbackContext);
         callbackStatus = alpc_finish_sync_callback(context, client,
                                                    callbackResult);
@@ -2313,15 +2501,16 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         }
     }
     if (callbackStatus == STATUS_PENDING) {
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         result = STATUS_PENDING;
         goto done;
     }
-    if (!alpc_set_frame_length(frame, context->maxMessageLength, replyLength)) {
+    if ((SIZE_T)replyLength > alpc_payload_capacity(context->maxMessageLength) ||
+        !alpc_set_frame_length(frame, context->maxMessageLength, replyLength)) {
         result = alpc_send_error_reply(context, replyPort, frame,
                                        STATUS_INFO_LENGTH_MISMATCH,
                                        &dropClient);
-        alpc_free(frame);
+        alpc_secure_free(frame, context->maxMessageLength);
         goto done;
     }
     frame->header.u2.ZeroInit = 0U;
@@ -2331,8 +2520,8 @@ NTSTATUS AlpcPort_ProcessClientEventEx(PALPC_PORT_SERVER_CONTEXT context,
         replyPort, ALPC_PORT_SEND_FLAG_REPLY_MESSAGE,
         &frame->header, NULL,
         NULL, NULL, NULL, &noWait);
-    alpc_free(frame);
-    if (sendStatus == STATUS_TIMEOUT || !NT_SUCCESS(sendStatus)) {
+    alpc_secure_free(frame, context->maxMessageLength);
+    if (sendStatus != STATUS_SUCCESS) {
         dropClient = 1U;
         result = sendStatus;
         goto done;
@@ -2446,21 +2635,45 @@ NTSTATUS AlpcPort_ServerReply(PALPC_PORT_SERVER_CONTEXT context,
     PALPC_PORT_FRAME frame = NULL;
     SIZE_T capacity = 0U;
     SIZE_T frameLength = 0U;
+    LARGE_INTEGER deadline = ALPC_PORT_ZERO_INIT;
     LARGE_INTEGER timeoutValue = ALPC_PORT_ZERO_INIT;
+    const LARGE_INTEGER *deadlineArgument = NULL;
     PLARGE_INTEGER timeoutArgument = NULL;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     uint8_t releasePending = 0U;
     uint8_t ready = 0U;
     uint8_t frameAllocated = 0U;
+    uint8_t deadlineExpired = 0U;
 
     if (!context || !token || !token->opaque || token->cookie == 0U ||
         (payloadLength != 0U && !payload) ||
+        requestStatus == STATUS_PENDING ||
         !context->api.pfnNtAlpcSendWaitReceivePort) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
     }
     if (alpc_state_load(&context->initialized) == 0 ||
         !alpc_lifetime_acquire(&context->lifetime)) {
         return ALPC_PORT_STATUS(STATUS_PORT_DISCONNECTED);
+    }
+    if (timeout) {
+        if (timeout->QuadPart == 0) {
+            /* Zero means a nonblocking Native send attempt.  It is a transport
+             * wait budget, not permission to rewrite the caller's application
+             * status or payload. */
+            timeoutValue.QuadPart = 0;
+            timeoutArgument = &timeoutValue;
+        } else {
+            status = AlpcPort_NormalizeTimeout(
+                context->api.pfnNtQuerySystemTime, timeout, &deadline);
+            if (status == STATUS_TIMEOUT) {
+                deadlineExpired = 1U;
+            } else if (status != STATUS_SUCCESS) {
+                alpc_lifetime_release(&context->lifetime);
+                return status;
+            } else {
+                deadlineArgument = &deadline;
+            }
+        }
     }
 
     /* Claim by registry identity and cookie.  The token pointer is never
@@ -2513,9 +2726,13 @@ NTSTATUS AlpcPort_ServerReply(PALPC_PORT_SERVER_CONTEXT context,
     if (!ready) {
         goto reply_done;
     }
+    if (deadlineExpired) {
+        status = STATUS_TIMEOUT;
+        goto pre_send_failure;
+    }
 
     capacity = context->maxMessageLength;
-    if ((SIZE_T)payloadLength > capacity - (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET) {
+    if ((SIZE_T)payloadLength > alpc_payload_capacity(capacity)) {
         status = STATUS_INFO_LENGTH_MISMATCH;
         goto pre_send_failure;
     }
@@ -2540,9 +2757,15 @@ NTSTATUS AlpcPort_ServerReply(PALPC_PORT_SERVER_CONTEXT context,
     frame->header.MessageId = pending->request.MessageId;
     frame->header.u3 = pending->request.u3;
     frame->Status = requestStatus;
-    if (timeout) {
-        timeoutValue = *timeout;
-        timeoutArgument = &timeoutValue;
+    if (deadlineArgument) {
+        status = alpc_refresh_timeout(context->api.pfnNtQuerySystemTime,
+                                      deadlineArgument, &timeoutValue,
+                                      &timeoutArgument);
+        if (status == STATUS_TIMEOUT) {
+            goto pre_send_failure;
+        } else if (status != STATUS_SUCCESS) {
+            goto pre_send_failure;
+        }
     }
 
     /* Recheck cancellation immediately before the one native send attempt.
@@ -2607,8 +2830,10 @@ pre_send_failure:
 
 reply_done:
     if (frame && frameAllocated) {
-        alpc_free(frame);
+        alpc_secure_free(frame, frameLength);
     }
+    (void)libc_memset_s(&emergencyFrame, sizeof(emergencyFrame), 0,
+                        sizeof(emergencyFrame));
     alpc_lock_release(&client->receiveLock);
     if (releasePending) {
         token->opaque = NULL;
@@ -2659,6 +2884,65 @@ NTSTATUS AlpcPort_ServerGetClientToken(PALPC_PORT_SERVER_CONTEXT context,
     return token->opaque ? STATUS_SUCCESS : STATUS_PORT_DISCONNECTED;
 }
 
+NTSTATUS AlpcPort_ServerAcquireEndpoint(
+    PALPC_PORT_SERVER_CONTEXT context,
+    const ALPC_PORT_ENDPOINT_TOKEN *token,
+    PALPC_PORT_ENDPOINT_REFERENCE reference)
+{
+    PALPC_PORT_SERVER_CLIENT current = NULL;
+    PALPC_PORT_SERVER_CLIENT client = NULL;
+
+    if (reference) {
+        libc_memset(reference, 0, sizeof(*reference));
+    }
+    if (!context || !token || !token->opaque || token->cookie == 0U ||
+        !reference || alpc_state_load(&context->initialized) == 0 ||
+        !alpc_lifetime_acquire(&context->lifetime)) {
+        return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
+    }
+
+    alpc_lock_acquire(&context->lockWord);
+    for (current = (PALPC_PORT_SERVER_CLIENT)List_Head(&context->clientList);
+         current != NULL;
+         current = (PALPC_PORT_SERVER_CLIENT)List_Next(&current->listEntry)) {
+        if ((PVOID)current == token->opaque &&
+            current->endpointCookie == token->cookie &&
+            current->portHandle &&
+            alpc_lifetime_acquire(&current->lifetime)) {
+            client = current;
+            break;
+        }
+    }
+    alpc_lock_release(&context->lockWord);
+
+    if (!client) {
+        alpc_lifetime_release(&context->lifetime);
+        return ALPC_PORT_STATUS(STATUS_PORT_DISCONNECTED);
+    }
+    reference->opaque = client;
+    reference->cookie = client->endpointCookie;
+    reference->portHandle = client->portHandle;
+    return STATUS_SUCCESS;
+}
+
+void AlpcPort_ServerReleaseEndpoint(
+    PALPC_PORT_SERVER_CONTEXT context,
+    PALPC_PORT_ENDPOINT_REFERENCE reference)
+{
+    PALPC_PORT_SERVER_CLIENT client = NULL;
+
+    if (!context || !reference || !reference->opaque ||
+        reference->cookie == 0U) {
+        return;
+    }
+    client = (PALPC_PORT_SERVER_CLIENT)reference->opaque;
+    reference->opaque = NULL;
+    reference->cookie = 0U;
+    reference->portHandle = NULL;
+    alpc_lifetime_release(&client->lifetime);
+    alpc_lifetime_release(&context->lifetime);
+}
+
 NTSTATUS AlpcPort_ServerDisconnectClientToken(
     PALPC_PORT_SERVER_CONTEXT context,
     const ALPC_PORT_ENDPOINT_TOKEN *token)
@@ -2692,6 +2976,21 @@ NTSTATUS AlpcPort_ServerDisconnectClientToken(
     return status;
 }
 
+uint8_t AlpcPort_ServerAcquire(PALPC_PORT_SERVER_CONTEXT context)
+{
+    if (!context || alpc_state_load(&context->initialized) == 0) {
+        return 0U;
+    }
+    return (uint8_t)(alpc_lifetime_acquire(&context->lifetime) ? 1U : 0U);
+}
+
+void AlpcPort_ServerRelease(PALPC_PORT_SERVER_CONTEXT context)
+{
+    if (context) {
+        alpc_lifetime_release(&context->lifetime);
+    }
+}
+
 uint8_t AlpcPort_ServerHasNativePortContext(
     const ALPC_PORT_SERVER_CONTEXT *context)
 {
@@ -2704,6 +3003,7 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
                           PALPC_PORT_CLIENT_CONTEXT context)
 {
     ALPC_PORT_SDK_ATTRIBUTES portAttributes = ALPC_PORT_ZERO_INIT;
+    OBJECT_ATTRIBUTES objectAttributes = ALPC_PORT_ZERO_INIT;
     SECURITY_QUALITY_OF_SERVICE securityQos = ALPC_PORT_ZERO_INIT;
     PALPC_PORT_FRAME connectionFrame = NULL;
     SIZE_T bufferLength = 0;
@@ -2715,6 +3015,9 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     if (!config || !context || alpc_state_load(&context->initialized) != 0 ||
+        context->portHandle || context->unicodeName.Buffer ||
+        context->sendLock.initialized || context->receiveLock.initialized ||
+        context->lifetime.initialized ||
         !alpc_name_valid(&config->portName) || !alpc_client_api_valid(&config->api)) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
     }
@@ -2734,20 +3037,20 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
     alpc_reset_client_context(context);
     context->api = config->api;
     if (!alpc_lifetime_init(&context->lifetime) ||
-        !alpc_lock_init(&context->sendLock) ||
+        !alpc_wait_lock_init(&context->sendLock) ||
         !alpc_lock_init(&context->receiveLock)) {
         alpc_lock_destroy(&context->receiveLock);
         alpc_lifetime_destroy(&context->lifetime);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_reset_client_context(context);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     status = alpc_build_unicode_name(context->api.pfnRtlInitAnsiString,
                                       context->api.pfnRtlAnsiStringToUnicodeString,
                                       &config->portName, &context->unicodeName);
-    if (!NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS) {
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return status;
@@ -2756,7 +3059,7 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
     if (!connectionFrame) {
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -2764,10 +3067,10 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
     if (!alpc_init_frame(connectionFrame, maxMessageLength,
                          (USHORT)ALPC_PORT_MESSAGE_TYPE_CONNECTION_REQUEST,
                          config->helloId, 0, NULL, 0)) {
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return STATUS_INFO_LENGTH_MISMATCH;
@@ -2778,25 +3081,27 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
                               config->portFlags |
                                   ALPC_PORT_FLAG_ALLOW_LPC_REQUESTS,
                               0, 0, 0, 0, &securityQos);
+    alpc_init_object_attributes(&objectAttributes, NULL, NULL);
     bufferLength = maxMessageLength;
     status = alpc_refresh_timeout(context->api.pfnNtQuerySystemTime,
                                   deadlineArgument, &remainingTimeout,
                                   &timeoutArgument);
     if (status != STATUS_SUCCESS) {
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return status;
     }
     status = context->api.pfnNtAlpcConnectPort(
-        &context->portHandle, &context->unicodeName, NULL, &portAttributes, 0,
-        NULL, &connectionFrame->header, &bufferLength, NULL, NULL,
+        &context->portHandle, &context->unicodeName, &objectAttributes,
+        &portAttributes, 0, config->requiredServerSid,
+        &connectionFrame->header, &bufferLength, NULL, NULL,
         timeoutArgument);
-    if (status == STATUS_TIMEOUT || !NT_SUCCESS(status) || !context->portHandle) {
-        if (status != STATUS_TIMEOUT && NT_SUCCESS(status)) {
+    if (status != STATUS_SUCCESS || !context->portHandle) {
+        if (status == STATUS_SUCCESS) {
             status = STATUS_DATA_ERROR;
         }
         if (context->portHandle && context->api.pfnNtClose) {
@@ -2805,10 +3110,10 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
             }
             context->api.pfnNtClose(context->portHandle);
         }
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return status;
@@ -2825,10 +3130,10 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
             }
             context->api.pfnNtClose(context->portHandle);
         }
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return STATUS_DATA_ERROR;
@@ -2853,10 +3158,10 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
         if (context->api.pfnNtClose) {
             (void)context->api.pfnNtClose(context->portHandle);
         }
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return status;
@@ -2883,16 +3188,16 @@ NTSTATUS AlpcPort_Connect(PALPC_PORT_CLIENT_CONFIG config,
         if (context->api.pfnNtClose) {
             (void)context->api.pfnNtClose(context->portHandle);
         }
-        alpc_free(connectionFrame);
+        alpc_secure_free(connectionFrame, maxMessageLength);
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
         alpc_lock_destroy(&context->receiveLock);
-        alpc_lock_destroy(&context->sendLock);
+        alpc_wait_lock_destroy(&context->sendLock);
         alpc_lifetime_destroy(&context->lifetime);
         alpc_reset_client_context(context);
         return markerStatus;
     }
     alpc_state_store(&context->initialized, 1);
-    alpc_free(connectionFrame);
+    alpc_secure_free(connectionFrame, maxMessageLength);
     return STATUS_SUCCESS;
 }
 
@@ -2928,13 +3233,18 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
         (!message && messageLength) || (flags & ~ALPC_PORT_SEND_FLAG_ASYNC)) {
         return ALPC_PORT_STATUS(STATUS_INVALID_PARAMETER);
     }
-    if (context->maxMessageLength < (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET ||
-        (SIZE_T)messageLength > context->maxMessageLength -
-                                (SIZE_T)ALPC_PORT_FRAME_DATA_OFFSET) {
+    if (context->maxMessageLength < ALPC_PORT_CROSS_ARCH_FRAME_DATA_OFFSET ||
+        (SIZE_T)messageLength > alpc_payload_capacity(
+                                    context->maxMessageLength)) {
         return STATUS_INFO_LENGTH_MISMATCH;
     }
     if (!alpc_lifetime_acquire(&context->lifetime)) {
         return STATUS_DEVICE_BUSY;
+    }
+    if (alpc_state_load(&context->initialized) == 0 ||
+        !context->portHandle) {
+        alpc_lifetime_release(&context->lifetime);
+        return STATUS_PORT_DISCONNECTED;
     }
     if (timeout) {
         status = AlpcPort_NormalizeTimeout(
@@ -2951,8 +3261,22 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
      * them to proceed independently prevents a receive callback from waiting
      * behind a synchronous request whose peer needs that callback to finish. */
     if (!asynchronous) {
-        alpc_lock_acquire(&context->sendLock);
+        status = alpc_wait_lock_acquire(
+            &context->sendLock, context->api.pfnNtQuerySystemTime,
+            deadlineArgument);
+        if (status != STATUS_SUCCESS) {
+            alpc_lifetime_release(&context->lifetime);
+            return status;
+        }
         sendLockHeld = 1U;
+        /* Disconnect may have started while this call waited behind another
+         * synchronous request.  It keeps the handle storage alive through the
+         * lifetime pin, but no new Native send may start after shutdown. */
+        if (alpc_state_load(&context->initialized) == 0 ||
+            !context->portHandle) {
+            result = STATUS_PORT_DISCONNECTED;
+            goto done;
+        }
     }
     requestFrame = (PALPC_PORT_FRAME)alpc_alloc(context->maxMessageLength);
     if (!requestFrame) {
@@ -2961,7 +3285,7 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
     }
     if (!alpc_init_frame(requestFrame, context->maxMessageLength, 0U,
                          controlId, flags, message, messageLength)) {
-        alpc_free(requestFrame);
+        alpc_secure_free(requestFrame, context->maxMessageLength);
         result = STATUS_INFO_LENGTH_MISMATCH;
         goto done;
     }
@@ -2970,20 +3294,20 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                                       deadlineArgument, &timeoutValue,
                                       &timeoutArgument);
         if (status != STATUS_SUCCESS) {
-            alpc_free(requestFrame);
+            alpc_secure_free(requestFrame, context->maxMessageLength);
             result = status;
             goto done;
         }
         status = context->api.pfnNtAlpcSendWaitReceivePort(
             context->portHandle, 0, &requestFrame->header, NULL, NULL, NULL,
             NULL, timeoutArgument);
-        alpc_free(requestFrame);
+        alpc_secure_free(requestFrame, context->maxMessageLength);
         result = status;
         goto done;
     }
     replyFrame = (PALPC_PORT_FRAME)alpc_alloc(context->maxMessageLength);
     if (!replyFrame) {
-        alpc_free(requestFrame);
+        alpc_secure_free(requestFrame, context->maxMessageLength);
         result = STATUS_INSUFFICIENT_RESOURCES;
         goto done;
     }
@@ -2998,8 +3322,8 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                                   deadlineArgument, &timeoutValue,
                                   &timeoutArgument);
     if (status != STATUS_SUCCESS) {
-        alpc_free(requestFrame);
-        alpc_free(replyFrame);
+        alpc_secure_free(requestFrame, context->maxMessageLength);
+        alpc_secure_free(replyFrame, context->maxMessageLength);
         result = status;
         goto done;
     }
@@ -3007,7 +3331,7 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
         context->portHandle, ALPC_PORT_NATIVE_FLAG_SYNC_REQUEST,
         &requestFrame->header, NULL, &replyFrame->header,
         &replyLength, NULL, timeoutArgument);
-    if (status != STATUS_TIMEOUT && NT_SUCCESS(status)) {
+    if (status == STATUS_SUCCESS) {
         /* A connection-complete marker may be queued after Connect's
          * best-effort poll.  Drain only that native control message.  Real
          * Windows reports a synchronous reply as LPC_REQUEST, so Type cannot
@@ -3027,20 +3351,20 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                 status = context->api.pfnNtAlpcSendWaitReceivePort(
                     context->portHandle, 0, NULL, NULL, &replyFrame->header,
                     &replyLength, NULL, timeoutArgument);
-                if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
+                if (status != STATUS_SUCCESS) {
                     break;
                 }
                 continue;
             }
             break;
         }
-        if (receiveAttempts == 16U && NT_SUCCESS(status)) {
+        if (receiveAttempts == 16U && status == STATUS_SUCCESS) {
             status = STATUS_DEVICE_BUSY;
         }
     }
-    alpc_free(requestFrame);
-    if (status == STATUS_TIMEOUT || !NT_SUCCESS(status)) {
-        alpc_free(replyFrame);
+    alpc_secure_free(requestFrame, context->maxMessageLength);
+    if (status != STATUS_SUCCESS) {
+        alpc_secure_free(replyFrame, context->maxMessageLength);
         result = status;
         goto done;
     }
@@ -3048,7 +3372,7 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
                                    context->maxMessageLength) ||
         replyFrame->ControlId != controlId ||
         replyFrame->Flags != 0) {
-        alpc_free(replyFrame);
+        alpc_secure_free(replyFrame, context->maxMessageLength);
         result = STATUS_DATA_ERROR;
         goto done;
     }
@@ -3057,33 +3381,36 @@ NTSTATUS AlpcPort_SendMessage(PALPC_PORT_CLIENT_CONTEXT context,
     if (replyCopyLength && replyCallback) {
         replyCopy = alpc_alloc(replyCopyLength);
         if (!replyCopy) {
-            alpc_free(replyFrame);
+            alpc_secure_free(replyFrame, context->maxMessageLength);
             result = STATUS_INSUFFICIENT_RESOURCES;
             goto done;
         }
         libc_memcpy(replyCopy, replyFrame->data, replyCopyLength);
     }
     haveReply = 1;
-    alpc_free(replyFrame);
+    alpc_secure_free(replyFrame, context->maxMessageLength);
     callbackStatus = STATUS_SUCCESS;
-    /* STATUS_TIMEOUT is numerically non-negative in NTSTATUS, but it is a
-     * terminal timeout for RPC and must not be folded into transport success. */
-    result = (remoteStatus == STATUS_TIMEOUT || !NT_SUCCESS(remoteStatus))
-                 ? remoteStatus : status;
+    /* A completed RPC returns the peer callback's exact terminal status,
+     * including positive informational values.  STATUS_PENDING is reserved
+     * for the server's captured/deferred state and is never a valid final
+     * reply on the wire. */
+    result = remoteStatus == STATUS_PENDING
+                 ? STATUS_DATA_ERROR
+                 : (remoteStatus != STATUS_SUCCESS ? remoteStatus : status);
 
 done:
     if (sendLockHeld) {
-        alpc_lock_release(&context->sendLock);
+        alpc_wait_lock_release(&context->sendLock);
     }
-    alpc_lifetime_release(&context->lifetime);
     if (haveReply && replyCallback) {
         callbackStatus = replyCallback((const uint8_t *)replyCopy,
                                        replyCopyLength, callbackContext);
-        if (!NT_SUCCESS(callbackStatus)) {
+        if (callbackStatus != STATUS_SUCCESS) {
             result = callbackStatus;
         }
     }
-    alpc_free(replyCopy);
+    alpc_secure_free(replyCopy, (SIZE_T)replyCopyLength);
+    alpc_lifetime_release(&context->lifetime);
     return result;
 }
 
@@ -3142,7 +3469,7 @@ void AlpcPort_DisConnect(PALPC_PORT_CLIENT_CONTEXT context)
         context->api.pfnRtlFreeUnicodeString(&context->unicodeName);
     }
     alpc_lock_destroy(&context->receiveLock);
-    alpc_lock_destroy(&context->sendLock);
+    alpc_wait_lock_destroy(&context->sendLock);
     alpc_lifetime_destroy(&context->lifetime);
     alpc_reset_client_context(context);
 }

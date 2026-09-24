@@ -7,8 +7,8 @@
  * this demo keeps one ProcessBlockedEventEx dispatcher running and uses native
  * PortContext to select the accepted handle for replies and close notification.
  *
- * Build with a Windows SDK and the ALPC implementation, for example:
- *   cl /W4 /WX alpc_demo.c alpc_port.c allocator.c libc.c list.c /Fe:alpc_demo.exe
+ * From the source root, build with a Windows SDK and the ALPC implementation:
+ *   cl /W4 /WX /wd4005 /I. Demo\alpc_demo.c alpc_port.c allocator.c libc.c list.c /Fe:alpc_demo.exe
  *
  * Native functions are resolved from ntdll.dll at runtime.  The relative
  * LARGE_INTEGER values below are one-second or five-second 100ns intervals.

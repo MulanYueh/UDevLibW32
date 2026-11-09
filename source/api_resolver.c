@@ -616,17 +616,6 @@ ArFindSystemModuleByName(
 #endif
 }
 
-/* Returned loader entries are borrowed pointers; callers must not retain them
- * across module unload or process teardown. */
-NTSTATUS
-GetSystemModuleDataEntryByName2(
-	IN PUNICODE_STRING ModuleName,
-	OUT PKLDR_DATA_TABLE_ENTRY *OutDataEntry
-	)
-{
-	return ArFindSystemModuleByName(ModuleName, OutDataEntry);
-}
-
 static NTSTATUS
 ArFindProcessModuleByName(
 	IN PUNICODE_STRING ModuleName,
